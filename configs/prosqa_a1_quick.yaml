@@ -1,0 +1,48 @@
+experiment_name: prosqa_a1_quick
+data:
+  train_path: dataset/prosqa_train.json
+  valid_path: dataset/prosqa_valid.json
+  test_path: dataset/prosqa_test.json
+  train_max_records: 128
+  valid_max_records: 64
+  test_max_records: 64
+  max_prefix_tokens: 256
+  max_step_tokens: 64
+  max_horizon: 3
+  batch_size: 8
+  num_workers: 0
+  text_separator: "\n"
+  drop_empty_steps: true
+model:
+  backbone_type: gpt2
+  tokenizer_name_or_path: gpt2
+  model_name_or_path:
+  vocab_size: 50257
+  embedding_dim: 256
+  hidden_dim: 256
+  latent_dim: 256
+  n_layer: 4
+  n_head: 4
+  n_positions: 512
+  dropout: 0.1
+  init_source: ntp
+  init_checkpoint:
+codec_objective:
+  name: standard
+  horizon_weights: [1.0, 0.5, 0.25]
+transition:
+  hidden_dim: 256
+  num_layers: 2
+  dropout: 0.1
+  init_source: random
+  init_checkpoint:
+train:
+  epochs: 2
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  seed: 42
+  device: cpu
+  output_dir: outputs/prosqa_a1_quick
+  log_every: 5
+

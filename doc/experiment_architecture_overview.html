@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Latent Reasoning Experiment</title>
+  <style>
+    :root {
+      --bg: #f6f1e8;
+      --paper: #fffdf8;
+      --ink: #1f1b17;
+      --muted: #6b645c;
+      --line: #d8cfc0;
+      --accent: #a84c2d;
+      --accent-soft: #f2d8cd;
+      --blue: #456c86;
+      --blue-soft: #dbe8f1;
+      --green: #4d6a51;
+      --green-soft: #dce8dc;
+      --shadow: 0 16px 34px rgba(52, 37, 20, 0.10);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", Georgia, serif;
+      background:
+        radial-gradient(circle at 0% 0%, rgba(168, 76, 45, 0.08), transparent 22%),
+        linear-gradient(180deg, #f8f3eb 0%, var(--bg) 100%);
+      color: var(--ink);
+    }
+
+    .page {
+      max-width: 1380px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .card {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 26px 30px 20px;
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(255, 253, 248, 0.98), rgba(244, 236, 224, 0.96));
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent);
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 38px;
+      line-height: 1.08;
+    }
+
+    .subtitle {
+      margin-top: 12px;
+      max-width: 1000px;
+      color: var(--muted);
+      font-size: 17px;
+      line-height: 1.6;
+    }
+
+    .content {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 0;
+    }
+
+    .left {
+      padding: 24px;
+      border-right: 1px solid var(--line);
+    }
+
+    .right {
+      padding: 24px;
+    }
+
+    h2 {
+      margin: 0 0 14px 0;
+      font-size: 23px;
+    }
+
+    .section-note {
+      margin: 0 0 16px 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.55;
+    }
+
+    .arch {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: linear-gradient(180deg, #fffefb 0%, #f8f1e7 100%);
+      padding: 16px;
+    }
+
+    svg {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .swatch {
+      width: 13px;
+      height: 13px;
+      border-radius: 4px;
+      border: 1px solid rgba(0, 0, 0, 0.08);
+    }
+
+    .question-block {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fff;
+      padding: 16px 16px 14px;
+      margin-bottom: 14px;
+    }
+
+    .question-block:last-child {
+      margin-bottom: 0;
+    }
+
+    .question-block .tag {
+      display: inline-block;
+      margin-bottom: 8px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    .tag-1 {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .tag-2 {
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .question-block strong {
+      display: block;
+      font-size: 18px;
+      margin-bottom: 8px;
+    }
+
+    .question-block p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .bullets {
+      margin-top: 10px;
+      padding-left: 18px;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+    }
+
+    .bottom {
+      border-top: 1px solid var(--line);
+      padding: 18px 24px 22px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      background: rgba(255, 252, 246, 0.95);
+    }
+
+    .summary {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      background: #fff;
+    }
+
+    .summary .k {
+      font-size: 12px;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .summary .v {
+      font-size: 18px;
+      line-height: 1.5;
+      font-weight: 700;
+    }
+
+    @media (max-width: 1100px) {
+      .content, .bottom {
+        grid-template-columns: 1fr;
+      }
+
+      .left {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      h1 {
+        font-size: 31px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="card">
+      <div class="hero">
+        <div class="eyebrow">Single-Page Overview</div>
+        <h1>MTP 与 Latent Reasoning 实验：我们真正想验证什么</h1>
+        <div class="subtitle">
+          这套实验只围绕两个模块展开：
+          <b>1. 编码器-解码器架构</b>，
+          <b>2. latent 表征上的状态转换推理模型</b>。
+          核心问题不是“模型里有没有未来信息”，而是这些表征能不能变成
+          <b>更容易学习、可递推、对推理有用</b> 的 latent state。
+        </div>
+      </div>
+
+      <div class="content">
+        <div class="left">
+          <h2>1. 编码器-解码器架构</h2>
+          <p class="section-note">
+            输入是一段推理前缀：问题 + 已有步骤。模型先把这段前缀压成一个 latent 表征，再从这个表征生成当前步骤，
+            或者同时预测后续多个步骤。这里要验证的是：<b>MTP 初始化</b> 或 <b>多步监督</b> 是否能让这个 latent 表征更有预测性。
+          </p>
+
+          <div class="arch">
+            <svg viewBox="0 0 760 390" xmlns="http://www.w3.org/2000/svg" aria-label="Encoder decoder architecture">
+              <defs>
+                <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+                  <path d="M0,0 L0,6 L8,3 z" fill="#6b645c"></path>
+                </marker>
+              </defs>
+
+              <rect x="24" y="64" width="190" height="94" rx="18" fill="#fff" stroke="#d8cfc0"/>
+              <text x="119" y="98" text-anchor="middle" font-size="22" font-weight="700" fill="#1f1b17">输入前缀</text>
+              <text x="119" y="126" text-anchor="middle" font-size="14" fill="#6b645c">question + previous steps</text>
+
+              <rect x="278" y="54" width="198" height="112" rx="20" fill="#dbe8f1" stroke="#456c86"/>
+              <text x="377" y="92" text-anchor="middle" font-size="22" font-weight="700" fill="#1f1b17">编码器</text>
+              <text x="377" y="120" text-anchor="middle" font-size="14" fill="#456c86">把前缀压成 latent 表征 z</text>
+
+              <rect x="540" y="64" width="196" height="94" rx="18" fill="#f2d8cd" stroke="#a84c2d"/>
+              <text x="638" y="98" text-anchor="middle" font-size="22" font-weight="700" fill="#1f1b17">解码器</text>
+              <text x="638" y="126" text-anchor="middle" font-size="14" fill="#a84c2d">从 z 生成当前步骤或多个后续步骤</text>
+
+              <line x1="214" y1="111" x2="278" y2="111" stroke="#6b645c" stroke-width="2.5" marker-end="url(#arrow)"/>
+              <line x1="476" y1="111" x2="540" y2="111" stroke="#6b645c" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+              <rect x="204" y="248" width="352" height="82" rx="18" fill="#fff" stroke="#d8cfc0"/>
+              <text x="380" y="278" text-anchor="middle" font-size="20" font-weight="700" fill="#1f1b17">这里要验证的问题</text>
+              <text x="380" y="304" text-anchor="middle" font-size="15" fill="#6b645c">MTP 初始化是否让 z 更好学？</text>
+              <text x="380" y="324" text-anchor="middle" font-size="15" fill="#6b645c">多步监督是否让 z 更像“未来步骤的预测状态”？</text>
+            </svg>
+          </div>
+
+          <div class="legend">
+            <span><i class="swatch" style="background: var(--blue-soft)"></i>编码器：抽取 latent 表征</span>
+            <span><i class="swatch" style="background: var(--accent-soft)"></i>解码器：从 latent 读出步骤</span>
+          </div>
+        </div>
+
+        <div class="right">
+          <h2>2. Latent 表征上的状态转换推理模型</h2>
+          <p class="section-note">
+            当前缀被编码成 latent 表征之后，我们再单独学习一个状态转换模型，让它在 latent 空间里直接做
+            `zₜ → zₜ₊₁`。这里要验证的是：<b>不同训练方式得到的 latent 表征</b>，是否更适合做多步推理。
+          </p>
+
+          <div class="question-block">
+            <div class="tag tag-1">Hypothesis</div>
+            <strong>假设一：不同编码器产生的 latent 表征，对转换模型的可学习性会有差别</strong>
+            <p>
+              即使下游转换模型结构完全一样，不同编码器得到的 latent 表征空间也可能不同。
+              我们要验证的是：哪一种表征更容易支持 `zₜ → zₜ₊₁` 的学习与多步递推。
+            </p>
+          </div>
+
+          <div class="question-block">
+            <div class="tag tag-2">Hypothesis</div>
+            <strong>假设二：转换模型本身是否使用 MTP 初始化，也可能带来差别</strong>
+            <p>
+              在固定同一个 latent 表征空间的前提下，我们还要比较转换模型的初始化方式：
+              random、NTP、MTP。重点看 MTP 初始化是否给状态转换学习带来额外优势。
+            </p>
+          </div>
+
+          <div class="question-block">
+            <div class="tag tag-2">What To Verify</div>
+            <strong>这部分实验具体验证什么</strong>
+            <ul class="bullets">
+              <li>固定转换模型结构，不同编码器产生的表征空间有没有差别。</li>
+              <li>固定同一个表征空间，转换模型用 random / NTP / MTP 初始化有没有差别。</li>
+              <li>单步状态转换是否更容易学，多步 rollout 会不会迅速漂移。</li>
+              <li>连续 rollout 和“解码回文本再编码”的 rollout 差多少。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="bottom">
+        <div class="summary">
+          <div class="k">编码器-解码器部分要回答</div>
+          <div class="v">MTP 初始化或多步监督，能否让 latent 表征更像“未来步骤的预测状态”？</div>
+        </div>
+        <div class="summary">
+          <div class="k">状态转换模型部分要回答</div>
+          <div class="v">这种 latent 表征能否支持稳定的 `zₜ → zₜ₊₁` 递推，而不只是生成一条局部合理的文本？</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

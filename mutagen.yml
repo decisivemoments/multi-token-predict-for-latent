@@ -1,0 +1,26 @@
+sync:
+  defaults:
+    mode: two-way-resolved
+    ignore:
+      vcs: true
+      paths:
+        - ".git"
+        - ".venv"
+        - "__pycache__"
+        - ".pytest_cache"
+        - ".mypy_cache"
+        - "data"
+        - "dataset"
+        - "datasets"
+        - "model"
+        - "models"
+        - "checkpoints"
+        - "outputs"
+        - "*.pt"
+        - "*.bin"
+        - "*.safetensors"
+        - "mutagen.yml"
+        - "mutagen.lock"
+  codebase:
+    alpha: .
+    beta: "jyzhang@10.176.34.113:/home/jyzhang/pro/multi-token-predict-for-latent"

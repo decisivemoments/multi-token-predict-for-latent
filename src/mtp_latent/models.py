@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import torch
+from torch import nn
+from transformers import GPT2Config as HFGPT2Config
+from transformers import GPT2LMHeadModel, GPT2Model
+
+from mtp_latent.config import ModelConfig, TransitionConfig
+
+
+class ReasoningCodec(nn.Module):
+    def __init__(self, model_config: ModelConfig, pad_token_id: int) -> None:
+        super().__init__()
+        self.model_config = model_config
+        self.pad_token_id = pad_token_id
+
+        if model_config.model_name_or_path:
+            self.encoder = GPT2Model.from_pretrained(model_config.model_name_or_path)
+            self.decoder = GPT2LMHeadModel.from_pretrained(model_config.model_name_or_path)
+        else:
+            gpt2_config = HFGPT2Config(
+                vocab_size=model_config.vocab_size,
+                n_positions=model_config.n_positions,
+                n_ctx=model_config.n_positions,
+                n_embd=model_config.embedding_dim,
+                n_layer=model_config.n_layer,
+                n_head=model_config.n_head,
+                resid_pdrop=model_config.dropout,
+                embd_pdrop=model_config.dropout,
+                attn_pdrop=model_config.dropout,
+            )
+            self.encoder = GPT2Model(gpt2_config)
+            self.decoder = GPT2LMHeadModel(gpt2_config)
+
+        hidden_size = self.encoder.config.hidden_size
+        self.latent_proj = nn.Linear(hidden_size, model_config.latent_dim)
+        self.decoder_latent_proj = nn.Linear(model_config.latent_dim, self.decoder.config.n_embd)
+
+    def encode(self, prefix_ids: torch.Tensor, prefix_mask: torch.Tensor) -> torch.Tensor:
+        outputs = self.encoder(input_ids=prefix_ids, attention_mask=prefix_mask.long())
+        hidden_states = outputs.last_hidden_state
+        last_indices = prefix_mask.long().sum(dim=1) - 1
+        pooled = hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), last_indices]
+        return self.latent_proj(pooled)
+
+    def decode(self, latent: torch.Tensor, target_tokens: torch.Tensor) -> torch.Tensor:
+        token_inputs = target_tokens[:, :-1]
+        token_embeddings = self.decoder.transformer.wte(token_inputs)
+        latent_prefix = self.decoder_latent_proj(latent).unsqueeze(1)
+        inputs_embeds = torch.cat([latent_prefix, token_embeddings], dim=1)
+        attention_mask = torch.ones(inputs_embeds.size()[:2], device=inputs_embeds.device, dtype=torch.long)
+        outputs = self.decoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        return outputs.logits[:, 1:, :]
+
+    def load_init_checkpoint(self) -> None:
+        if not self.model_config.init_checkpoint:
+            return
+        state = torch.load(self.model_config.init_checkpoint, map_location="cpu")
+        if "model_state" in state:
+            state = state["model_state"]
+        self.load_state_dict(state, strict=False)
+
+
+class LatentTransitionModel(nn.Module):
+    def __init__(self, latent_dim: int, transition_config: TransitionConfig) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = latent_dim
+        for _ in range(max(transition_config.num_layers - 1, 0)):
+            layers.extend(
+                [
+                    nn.Linear(in_dim, transition_config.hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(transition_config.dropout),
+                ]
+            )
+            in_dim = transition_config.hidden_dim
+        layers.append(nn.Linear(in_dim, latent_dim))
+        self.network = nn.Sequential(*layers)
+        self.transition_config = transition_config
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.network(latent)
+
+    def load_init_checkpoint(self) -> None:
+        if not self.transition_config.init_checkpoint:
+            return
+        state = torch.load(self.transition_config.init_checkpoint, map_location="cpu")
+        if "transition_state" in state:
+            state = state["transition_state"]
+        self.load_state_dict(state, strict=False)
+
+
+@dataclass
+class ExperimentArtifacts:
+    output_dir: Path
+    best_codec_path: Path
+    best_transition_path: Path

@@ -1,0 +1,6 @@
+dataset
+*.pyc
+mutagen.yml.lock
+.DS_Store
+__pycache__
+*.log
