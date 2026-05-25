@@ -244,6 +244,9 @@ codec 输出质量：
 初步结论：
 mtp init model在作为表征生成器这一步上的效果比ntp略好
 
+解释：
+![alt text](./pic/inter.png)
+
 ---
 
 ## 6. 实验二：codec objective 从 NTP 改成 MTP 是否有收益
