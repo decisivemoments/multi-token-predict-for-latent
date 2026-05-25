@@ -8,7 +8,7 @@ from torch import nn
 from transformers import GPT2Config as HFGPT2Config
 from transformers import GPT2LMHeadModel, GPT2Model
 
-from mtp_latent.config import ModelConfig, TransitionConfig
+from mtp_latent.config import ModelConfig
 
 
 class ReasoningCodec(nn.Module):
@@ -54,48 +54,3 @@ class ReasoningCodec(nn.Module):
         attention_mask = torch.ones(inputs_embeds.size()[:2], device=inputs_embeds.device, dtype=torch.long)
         outputs = self.decoder(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         return outputs.logits[:, 1:, :]
-
-    def load_init_checkpoint(self) -> None:
-        if not self.model_config.init_checkpoint:
-            return
-        state = torch.load(self.model_config.init_checkpoint, map_location="cpu")
-        if "model_state" in state:
-            state = state["model_state"]
-        self.load_state_dict(state, strict=False)
-
-
-class LatentTransitionModel(nn.Module):
-    def __init__(self, latent_dim: int, transition_config: TransitionConfig) -> None:
-        super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = latent_dim
-        for _ in range(max(transition_config.num_layers - 1, 0)):
-            layers.extend(
-                [
-                    nn.Linear(in_dim, transition_config.hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(transition_config.dropout),
-                ]
-            )
-            in_dim = transition_config.hidden_dim
-        layers.append(nn.Linear(in_dim, latent_dim))
-        self.network = nn.Sequential(*layers)
-        self.transition_config = transition_config
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        return self.network(latent)
-
-    def load_init_checkpoint(self) -> None:
-        if not self.transition_config.init_checkpoint:
-            return
-        state = torch.load(self.transition_config.init_checkpoint, map_location="cpu")
-        if "transition_state" in state:
-            state = state["transition_state"]
-        self.load_state_dict(state, strict=False)
-
-
-@dataclass
-class ExperimentArtifacts:
-    output_dir: Path
-    best_codec_path: Path
-    best_transition_path: Path

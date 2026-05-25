@@ -68,6 +68,7 @@ class TrainConfig:
     output_dir: str = "outputs/default"
     log_every: int = 20
     tensorboard_dir: str | None = None
+    distributed_backend: str = "nccl"
 
 
 @dataclass

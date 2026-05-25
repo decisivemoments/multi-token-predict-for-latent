@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader, Dataset
 
 from mtp_latent.config import DataConfig
@@ -154,17 +155,27 @@ class ReasoningDataset(Dataset):
         }
 
 
-def build_dataloaders(data_config: DataConfig, tokenizer_name_or_path: str) -> tuple[ReasoningDataset, dict[str, DataLoader], object]:
+def build_dataloaders(
+    data_config: DataConfig,
+    tokenizer_name_or_path: str,
+    world_size: int = 1,
+    rank: int = 0,
+) -> tuple[ReasoningDataset, dict[str, DataLoader], object]:
     tokenizer = build_tokenizer(tokenizer_name_or_path)
     train_dataset = ReasoningDataset(data_config.train_path, data_config, tokenizer=tokenizer, split="train")
     valid_dataset = ReasoningDataset(data_config.valid_path, data_config, tokenizer=tokenizer, split="valid")
     test_dataset = ReasoningDataset(data_config.test_path, data_config, tokenizer=tokenizer, split="test")
 
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+
     loaders = {
         "train": DataLoader(
             train_dataset,
             batch_size=data_config.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             num_workers=data_config.num_workers,
             collate_fn=train_dataset.collate_fn,
         ),
@@ -172,6 +183,7 @@ def build_dataloaders(data_config: DataConfig, tokenizer_name_or_path: str) -> t
             valid_dataset,
             batch_size=data_config.batch_size,
             shuffle=False,
+            sampler=valid_sampler,
             num_workers=data_config.num_workers,
             collate_fn=valid_dataset.collate_fn,
         ),
@@ -179,6 +191,7 @@ def build_dataloaders(data_config: DataConfig, tokenizer_name_or_path: str) -> t
             test_dataset,
             batch_size=data_config.batch_size,
             shuffle=False,
+            sampler=test_sampler,
             num_workers=data_config.num_workers,
             collate_fn=test_dataset.collate_fn,
         ),

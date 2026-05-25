@@ -56,6 +56,7 @@ pip install -r requirements.txt
 - `encode`: GPT-2 encoder 取最后一个有效 token hidden state，再投影为 latent
 - `decode`: 把 latent 投影成一个 prefix embedding，拼到 GPT-2 decoder 输入前面
 - `train.device`: 支持 `auto`、`cuda`、`cuda:0`、`cpu`
+- `torchrun + DDP`: 支持多卡并行；单卡命令语义保持不变
 
 在服务器上先把下面四个 YAML 里的 `model.model_name_or_path` 改成实际模型路径：
 
@@ -66,9 +67,11 @@ configs/exp1_gsm_ntp_init.yaml
 configs/exp1_gsm_mtp_init.yaml
 ```
 
-然后直接运行对应脚本：
+然后直接运行对应脚本。默认会用 `torchrun` 按本机可见 GPU 数启动 DDP 多卡训练；如果只想用部分卡，可以手动指定 `NPROC_PER_NODE`：
 
 ```bash
+NPROC_PER_NODE=4 bash scripts/train_exp1_prosqa_ntp_init.sh
+
 bash scripts/train_exp1_prosqa_ntp_init.sh
 bash scripts/train_exp1_prosqa_mtp_init.sh
 bash scripts/train_exp1_gsm_ntp_init.sh

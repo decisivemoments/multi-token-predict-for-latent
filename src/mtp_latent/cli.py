@@ -10,7 +10,7 @@ from mtp_latent.config import ExperimentConfig
 from mtp_latent.data import build_dataloaders
 from mtp_latent.models import ReasoningCodec
 from mtp_latent.training import evaluate_codec, train_codec
-from mtp_latent.utils import load_json, resolve_device, save_json, set_seed
+from mtp_latent.utils import cleanup_distributed, init_distributed, load_json, save_json, set_seed
 
 
 def _load_codec_for_eval(codec: ReasoningCodec, checkpoint_path: str) -> None:
@@ -21,7 +21,9 @@ def _load_codec_for_eval(codec: ReasoningCodec, checkpoint_path: str) -> None:
 def run_train_codec(config_path: str) -> None:
     config = ExperimentConfig.from_yaml(config_path)
     set_seed(config.train.seed)
-    _, loaders, tokenizer = build_dataloaders(config.data, config.model.tokenizer_name_or_path)
+    world_size = int(__import__("os").environ.get("WORLD_SIZE", "1"))
+    rank = int(__import__("os").environ.get("RANK", "0"))
+    _, loaders, tokenizer = build_dataloaders(config.data, config.model.tokenizer_name_or_path, world_size=world_size, rank=rank)
     config.model.vocab_size = len(tokenizer)
     codec = ReasoningCodec(config.model, pad_token_id=tokenizer.pad_token_id)
     best_path = train_codec(codec, loaders, config)
@@ -31,23 +33,30 @@ def run_train_codec(config_path: str) -> None:
 def run_evaluate(config_path: str, codec_checkpoint: str) -> None:
     config = ExperimentConfig.from_yaml(config_path)
     set_seed(config.train.seed)
-    _, loaders, tokenizer = build_dataloaders(config.data, config.model.tokenizer_name_or_path)
+    world_size = int(__import__("os").environ.get("WORLD_SIZE", "1"))
+    rank = int(__import__("os").environ.get("RANK", "0"))
+    _, loaders, tokenizer = build_dataloaders(config.data, config.model.tokenizer_name_or_path, world_size=world_size, rank=rank)
     config.model.vocab_size = len(tokenizer)
     codec = ReasoningCodec(config.model, pad_token_id=tokenizer.pad_token_id)
     _load_codec_for_eval(codec, codec_checkpoint)
-    device = resolve_device(config.train.device)
+    dist_ctx = init_distributed(config.train.device, config.train.distributed_backend)
+    device = dist_ctx.device
     codec.to(device)
 
-    codec_metrics = evaluate_codec(codec, loaders["test"], config, device)
-    results = {
-        "codec_test_loss": codec_metrics.loss,
-        "codec_metrics": codec_metrics.metrics,
-    }
+    try:
+        codec_metrics = evaluate_codec(codec, loaders["test"], config, device)
+        results = {
+            "codec_test_loss": codec_metrics.loss,
+            "codec_metrics": codec_metrics.metrics,
+        }
 
-    output_dir = Path(config.train.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_json(output_dir / "evaluation.json", results)
-    print(output_dir / "evaluation.json")
+        if dist_ctx.is_main_process:
+            output_dir = Path(config.train.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            save_json(output_dir / "evaluation.json", results)
+            print(output_dir / "evaluation.json")
+    finally:
+        cleanup_distributed()
 
 
 def run_show_history(path: str) -> None:
