@@ -17,7 +17,7 @@ class DataConfig:
     test_max_records: int | None = None
     max_prefix_tokens: int = 256
     max_step_tokens: int = 64
-    max_horizon: int = 3
+    max_horizon: int = 1
     batch_size: int = 8
     num_workers: int = 0
     text_separator: str = "\n"
@@ -44,7 +44,7 @@ class ModelConfig:
 @dataclass
 class CodecObjectiveConfig:
     name: str = "standard"
-    horizon_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.25])
+    horizon_weights: list[float] = field(default_factory=lambda: [1.0])
     teacher_forcing: bool = True
 
 
@@ -64,7 +64,7 @@ class TrainConfig:
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
     seed: int = 42
-    device: str = "cpu"
+    device: str = "auto"
     output_dir: str = "outputs/default"
     log_every: int = 20
     tensorboard_dir: str | None = None
@@ -97,6 +97,5 @@ class ExperimentConfig:
             "data": self.data.__dict__,
             "model": self.model.__dict__,
             "codec_objective": self.codec_objective.__dict__,
-            "transition": self.transition.__dict__,
             "train": self.train.__dict__,
         }

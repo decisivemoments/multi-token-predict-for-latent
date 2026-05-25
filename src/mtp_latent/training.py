@@ -11,7 +11,7 @@ from tqdm import tqdm
 from mtp_latent.config import CodecObjectiveConfig, ExperimentConfig
 from mtp_latent.metrics import cosine_retrieval_metrics, masked_token_accuracy
 from mtp_latent.models import LatentTransitionModel, ReasoningCodec
-from mtp_latent.utils import ensure_dir, save_json
+from mtp_latent.utils import ensure_dir, resolve_device, save_json
 
 
 @dataclass
@@ -113,9 +113,10 @@ def train_codec(
     loaders,
     config: ExperimentConfig,
 ) -> Path:
-    device = torch.device(config.train.device)
+    device = resolve_device(config.train.device)
+    if config.model.init_checkpoint:
+        raise ValueError("Experiment 1 only supports initialization via model.model_name_or_path. Leave model.init_checkpoint empty.")
     codec.to(device)
-    codec.load_init_checkpoint()
     optimizer = torch.optim.AdamW(
         codec.parameters(),
         lr=config.train.learning_rate,
@@ -230,7 +231,7 @@ def train_transition(
     loaders,
     config: ExperimentConfig,
 ) -> Path:
-    device = torch.device(config.train.device)
+    device = resolve_device(config.train.device)
     codec.to(device)
     transition.to(device)
     transition.load_init_checkpoint()

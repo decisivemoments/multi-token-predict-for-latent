@@ -2,12 +2,12 @@
 
 本仓库实现了一个围绕 `doc/mtp_latent_reasoning_experiment_design.md` 的实验框架，目标是把 MTP 在 sentence-level latent reasoning 中的作用拆成可单独验证的实验轴，而不是把 MTP 与 latent reasoning 后训练混在一起比较。
 
-当前代码优先覆盖文档中的第一优先级主线：
+当前仓库先只对齐设计文档中的实验一：
 
-- `A1`: `NTP-init + standard codec objective`
-- `A2`: `MTP-init + standard codec objective`
-- `C1`: `NTP-init + step-level MTP codec objective`
-- `C2`: `MTP-init + step-level MTP codec objective`
+- `ProsQA + NTP-init`
+- `ProsQA + MTP-init`
+- `GSM + NTP-init`
+- `GSM + MTP-init`
 
 ## 数据格式
 
@@ -49,69 +49,47 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 快速校准数据接口
-
-先用小样本检查 `dataset/` 中的真实数据是否被正确展开：
-
-```bash
-bash scripts/inspect_prosqa_quick.sh
-bash scripts/inspect_gsm_quick.sh
-```
-
 ## 运行
 
-当前 codec 已改为 GPT-2 架构：
+当前训练的是实验一里的 sentence-level predictive encoder-decoder：
 
 - `encode`: GPT-2 encoder 取最后一个有效 token hidden state，再投影为 latent
 - `decode`: 把 latent 投影成一个 prefix embedding，拼到 GPT-2 decoder 输入前面
+- `train.device`: 支持 `auto`、`cuda`、`cuda:0`、`cpu`
 
-先跑小样本：
+在服务器上先把下面四个 YAML 里的 `model.model_name_or_path` 改成实际模型路径：
 
 ```bash
-bash scripts/train_codec_prosqa_quick.sh
-bash scripts/train_transition_prosqa_quick.sh
+configs/exp1_prosqa_ntp_init.yaml
+configs/exp1_prosqa_mtp_init.yaml
+configs/exp1_gsm_ntp_init.yaml
+configs/exp1_gsm_mtp_init.yaml
+```
 
-bash scripts/train_codec_gsm_quick.sh
-bash scripts/train_transition_gsm_quick.sh
+然后直接运行对应脚本：
+
+```bash
+bash scripts/train_exp1_prosqa_ntp_init.sh
+bash scripts/train_exp1_prosqa_mtp_init.sh
+bash scripts/train_exp1_gsm_ntp_init.sh
+bash scripts/train_exp1_gsm_mtp_init.sh
 ```
 
 训练监控默认写到各自 `output_dir/tensorboard/`。查看方式：
 
 ```bash
-tensorboard --logdir outputs
-```
-
-再跑完整配置：
-
-```bash
-PYTHONPATH=src python -m mtp_latent.cli train-codec --config configs/prosqa_a1.yaml
-```
-
-```bash
-PYTHONPATH=src python -m mtp_latent.cli train-transition \
-  --config configs/prosqa_a1.yaml \
-  --codec-checkpoint outputs/prosqa_a1/codec_best.pt
-```
-
-```bash
-PYTHONPATH=src python -m mtp_latent.cli evaluate \
-  --config configs/prosqa_a1.yaml \
-  --codec-checkpoint outputs/prosqa_a1/codec_best.pt \
-  --transition-checkpoint outputs/prosqa_a1/transition_best.pt
+bash scripts/tensorboard_exp1.sh
 ```
 
 ## 初始化与扩展
 
-- `model.init_checkpoint` 对应 codec 初始化来源，可填 NTP 或 MTP 预训练权重。
-- `transition.init_checkpoint` 对应 transition 初始化来源，可填 random / NTP / MTP。
-- `codec_objective.name` 支持：
-  - `standard`: 只训练 horizon-1。
-  - `step_mtp`: 同时训练 horizon-1/2/3。
+- 当前阶段只比较初始化来源，不训练 transition，也不做 step-level MTP objective。
+- 实验一配置里的 `max_horizon=1`，只预测当前 step。
+- 当前最重要的结果是四组实验的 `train loss` 和 `valid loss` TensorBoard 曲线。
 
-当前实现是 GPT-2 codec + MLP transition，适合先把实验逻辑、数据接口、指标与对照关系跑通。后续如果你要替换成你自己的 NTP/MTP checkpoint，只需要保持以下接口稳定：
+当前实现是 GPT-2 encoder-decoder 训练框架，后续如果你要继续做实验二、实验三，再在这个基础上继续加 objective 和 transition 相关入口。
 
 - `ReasoningCodec.encode(prefix_ids, prefix_mask) -> z`
 - `ReasoningCodec.decode(z, target_tokens) -> logits`
-- `LatentTransitionModel(z_t) -> z_t+1`
 
 更详细的代码说明见 [doc/code_experiment_guide.md](/Users/zhangjunyi/project/multi-token-predict-for-latent/doc/code_experiment_guide.md)。

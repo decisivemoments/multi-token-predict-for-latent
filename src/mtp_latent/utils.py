@@ -44,3 +44,11 @@ def build_tokenizer(name_or_path: str):
     if tokenizer.bos_token is None:
         tokenizer.bos_token = tokenizer.eos_token
     return tokenizer
+
+
+def resolve_device(device: str) -> torch.device:
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA was requested via train.device={device}, but no CUDA device is available.")
+    return torch.device(device)
