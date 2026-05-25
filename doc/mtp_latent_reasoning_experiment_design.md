@@ -231,6 +231,19 @@ codec 输出质量：
 
 > 在该 codec objective 和该任务上，MTP initialization 不是有效增量。
 
+### 实验结果
+#### 合成数据集
+
+![alt text](./pic/syn_500.png)
+![alt text](./pic/syn_1000.png)
+
+#### 真实数据集
+还没训完，部分结果
+![alt text](./pic/exp1_gsm8k.png)
+
+初步结论：
+mtp init model在作为表征生成器这一步上的效果比ntp略好
+
 ---
 
 ## 6. 实验二：codec objective 从 NTP 改成 MTP 是否有收益

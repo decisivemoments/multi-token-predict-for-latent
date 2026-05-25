@@ -2,12 +2,17 @@
 
 本仓库实现了一个围绕 `doc/mtp_latent_reasoning_experiment_design.md` 的实验框架，目标是把 MTP 在 sentence-level latent reasoning 中的作用拆成可单独验证的实验轴，而不是把 MTP 与 latent reasoning 后训练混在一起比较。
 
-当前仓库先只对齐设计文档中的实验一：
+当前仓库当前对齐设计文档中的两组实验：
 
 - `ProsQA + NTP-init`
 - `ProsQA + MTP-init`
 - `GSM + NTP-init`
 - `GSM + MTP-init`
+
+分别覆盖：
+
+- 实验一：`standard` objective
+- 实验二A：`decoder_token_mtp` objective
 
 ## 数据格式
 
@@ -26,10 +31,8 @@
 
 - `prefix = question + previous_steps`
 - `target_1 = current_step`
-- `target_2 = next_step`
-- `target_3 = next_next_step`
 
-超出长度的 horizon 会自动 mask。
+实验一和实验二A都固定 `data.max_horizon = 1`，因此这里只监督 `current_step`。实验二A的多未来预测发生在 `current_step` 的 token 序列内部，而不是 step 级别。
 
 ## 目录结构
 
@@ -51,20 +54,31 @@ pip install -r requirements.txt
 
 ## 运行
 
-当前训练的是实验一里的 sentence-level predictive encoder-decoder：
+当前训练的是 sentence-level predictive encoder-decoder：
 
 - `encode`: GPT-2 encoder 取最后一个有效 token hidden state，再投影为 latent
 - `decode`: 把 latent 投影成一个 prefix embedding，拼到 GPT-2 decoder 输入前面
 - `train.device`: 支持 `auto`、`cuda`、`cuda:0`、`cpu`
 - `torchrun + DDP`: 支持多卡并行；单卡命令语义保持不变
 
-在服务器上先把下面四个 YAML 里的 `model.model_name_or_path` 改成实际模型路径：
+在服务器上先把对应 YAML 里的 `model.model_name_or_path` 改成实际模型路径。
+
+实验一配置：
 
 ```bash
 configs/exp1_prosqa_ntp_init.yaml
 configs/exp1_prosqa_mtp_init.yaml
 configs/exp1_gsm_ntp_init.yaml
 configs/exp1_gsm_mtp_init.yaml
+```
+
+实验二A配置：
+
+```bash
+configs/exp2a_prosqa_ntp_init.yaml
+configs/exp2a_prosqa_mtp_init.yaml
+configs/exp2a_gsm_ntp_init.yaml
+configs/exp2a_gsm_mtp_init.yaml
 ```
 
 然后直接运行对应脚本。默认会用 `torchrun` 按本机可见 GPU 数启动 DDP 多卡训练；如果只想用部分卡，可以手动指定 `NPROC_PER_NODE`：
@@ -76,19 +90,26 @@ bash scripts/train_exp1_prosqa_ntp_init.sh
 bash scripts/train_exp1_prosqa_mtp_init.sh
 bash scripts/train_exp1_gsm_ntp_init.sh
 bash scripts/train_exp1_gsm_mtp_init.sh
+
+bash scripts/train_exp2a_prosqa_ntp_init.sh
+bash scripts/train_exp2a_prosqa_mtp_init.sh
+bash scripts/train_exp2a_gsm_ntp_init.sh
+bash scripts/train_exp2a_gsm_mtp_init.sh
 ```
 
 训练监控默认写到各自 `output_dir/tensorboard/`。查看方式：
 
 ```bash
 bash scripts/tensorboard_exp1.sh
+bash scripts/tensorboard_exp2a.sh
 ```
 
 ## 初始化与扩展
 
-- 当前阶段只比较初始化来源，不训练 transition，也不做 step-level MTP objective。
-- 实验一配置里的 `max_horizon=1`，只预测当前 step。
-- 当前最重要的结果是四组实验的 `train loss` 和 `valid loss` TensorBoard 曲线。
+- 当前阶段不训练 transition，也不做 step-level MTP objective。
+- 实验一和实验二A都固定 `max_horizon=1`，只预测当前 step。
+- 实验二A额外在 decoder hidden state 上预测 `current token / next token / next next token`。
+- 当前最重要的结果是各组实验的 `train loss`、`valid loss` 和 token-horizon 指标 TensorBoard 曲线。
 
 当前实现是 GPT-2 encoder-decoder 训练框架，后续如果你要继续做实验二、实验三，再在这个基础上继续加 objective 和 transition 相关入口。
 
