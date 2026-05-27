@@ -4,9 +4,9 @@ import math
 
 import torch
 
-def masked_token_accuracy(logits: torch.Tensor, targets: torch.Tensor, pad_token_id: int) -> float:
+def masked_token_accuracy(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> float:
     predictions = logits.argmax(dim=-1)
-    mask = targets != pad_token_id
+    mask = targets != ignore_index
     correct = (predictions == targets) & mask
     total = mask.sum().item()
     if total == 0:

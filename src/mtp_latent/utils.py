@@ -13,7 +13,6 @@ from transformers import AutoTokenizer
 
 
 PAD_ID = 0
-BOS_ID = 1
 EOS_ID = 2
 UNK_ID = 3
 
@@ -43,8 +42,6 @@ def build_tokenizer(name_or_path: str):
     tokenizer = AutoTokenizer.from_pretrained(name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.bos_token is None:
-        tokenizer.bos_token = tokenizer.eos_token
     return tokenizer
 
 

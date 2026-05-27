@@ -131,6 +131,21 @@ x_i = question + s_1 + ... + s_{i-1}
 target = s_i
 ```
 
+这里的 `target = s_i` 指的是 step 文本本身。真正送进 decoder 的 token 序列在实现里会改写成：
+
+```text
+y_1 y_2 ... y_T [EOS]
+```
+
+其中：
+
+- `y_1 ... y_T` 是 `s_i` 的 tokenizer 输出
+- `EOS` 用于表示“这个 step 在这里结束”
+- tokenizer 本身不再额外自动插入 special tokens，避免和手工加入的 `EOS` 重复
+- decoder 不再显式使用 `BOS`；第一个 token 由 latent 直接预测
+
+这一步对实验一和实验二A都是统一的基础接口，不改变两组实验的变量控制。
+
 对实验一来说，配置里直接把 `max_horizon` 设为 `1`，只做当前 step 的监督。
 
 实验二A也保持 `max_horizon=1`。
@@ -146,6 +161,93 @@ target = s_i
 1. 能正确读取 `question / steps / answer`
 2. 能把每个 step 展开成 prefix-current-step pair
 3. 能在 `ProsQA` 和 `GSM` 上一致工作
+
+### 3.1 训练时每一步样本到底怎么做
+
+设当前一个训练样本对应：
+
+```text
+prefix = x_i
+step = s_i
+```
+
+记 step 的 token 为：
+
+```text
+y_1, y_2, ..., y_T
+```
+
+则 decoder 训练序列统一构造成：
+
+```text
+target_tokens = [y_1, y_2, ..., y_T, EOS]
+```
+
+这里配置里的 `max_step_tokens` 指的是整个 decoder 序列长度上限，也就是：
+
+```text
+step tokens + EOS
+```
+
+因此真正留给 step 文本本身的最大长度是：
+
+```text
+max_step_tokens - 1
+```
+
+teacher-forcing 输入不再有人造 `BOS`。decoder 输入由两部分组成：
+
+```text
+latent_prefix + [y_1, y_2, ..., y_T]
+```
+
+监督目标是：
+
+```text
+[y_1, y_2, ..., y_T, EOS]
+```
+
+实现里会额外构造一份 `labels`：
+
+- 有效位置保留真实 token id
+- padding 位置写成 `-100`
+
+因此 loss 的忽略逻辑不再依赖 `pad_token_id`，而是依赖：
+
+```text
+labels == -100
+```
+
+这一步的作用是保证：
+
+- 真实 `EOS` 一定参与 loss
+- 即使当前 tokenizer 的 `pad_token_id == eos_token_id`
+- 也不会把真实 `EOS` 误当成 padding 忽略掉
+
+这意味着：
+
+- latent 直接负责预测第一个 token `y_1`
+- 模型不仅学习生成 step 内容
+- 还必须学习在合适位置输出 `EOS`
+- 之后真正做离散 rollout 时，decoder 才有明确的停止信号
+
+### 3.2 为什么这里必须加 EOS
+
+如果不加 `EOS`，训练目标只能告诉 decoder：
+
+- 当前 token 后面应该接什么内容
+
+但不能告诉 decoder：
+
+- 什么时候这个 step 应该结束
+
+后果是：
+
+- 当前实验一和实验二A的训练 loss 虽然还能算
+- 但后面一旦和 transition model 结合，离散解码时就没有可靠的 stop criterion
+- 只能靠 `max_step_tokens` 强行截断
+
+这对后续 latent reasoning rollout 不够严谨。
 
 ## 4. 实验二A具体怎么实现
 
@@ -167,24 +269,44 @@ target = s_i
 设当前 step token 序列是：
 
 ```text
-y_1, y_2, y_3, ..., y_T
+y_1, y_2, y_3, ..., y_T, EOS
 ```
 
 decoder 在位置 `t` 产生 hidden state `h_t`。
 
 当前代码中：
 
-- `h_t` 的标准头预测 `y_t`
-- `h_t` 的 token-horizon-2 头预测 `y_{t+1}`
-- `h_t` 的 token-horizon-3 头预测 `y_{t+2}`
+- `h_0` 是 latent prefix 位置，对应预测 `y_1`
+- `h_t` 的标准头预测当前位置之后的下一个 token
+- `h_t` 的 token-horizon-2 头预测再往后 1 个 token
+- `h_t` 的 token-horizon-3 头预测再往后 2 个 token
 
 也就是说，默认的实验二A实现是：
 
 ```text
-h_t -> y_t
+h_0 -> y_1
+h_1 -> y_2
+...
 h_t -> y_{t+1}
 h_t -> y_{t+2}
+h_t -> y_{t+3}
 ```
+
+这里要注意，序列尾部的 `EOS` 也属于合法 target。
+
+因此实验二A下，靠近序列结尾的位置会出现这样的训练信号：
+
+```text
+h_{T} -> EOS
+```
+
+以及如果 horizon 足够大，也可能出现：
+
+```text
+h_{T-1} -> EOS
+```
+
+这正是我们希望保留的行为，因为 decoder 不仅要会生成文本，还要会判断 step 结束。
 
 ### 4.3 预测哪些 token
 
@@ -215,22 +337,33 @@ h_t -> y_{t+2}
 对 `horizon=1`：
 
 ```text
-logits(h_t) 对齐 target y_t
+logits(h_t) 对齐 target y_{t+1}
 ```
 
 对 `horizon=2`：
 
 ```text
-logits_2(h_t) 对齐 target y_{t+1}
+logits_2(h_t) 对齐 target y_{t+2}
 ```
 
 对 `horizon=3`：
 
 ```text
-logits_3(h_t) 对齐 target y_{t+2}
+logits_3(h_t) 对齐 target y_{t+3}
 ```
 
 对于超出句长的位置，自动 mask。
+
+在有 `EOS` 后：
+
+- `horizon=1` 的最后一个有效 target 是 `EOS`
+- `horizon=2`、`horizon=3` 如果越过 `EOS` 之后没有合法 token，就自然被 mask
+
+因此：
+
+- 实验一的 `token_h1_loss` 现在包含“是否正确结束”
+- 实验二A的 `token_h1_loss` 也是同一口径
+- 所以实验一和实验二A的 `primary_loss / token_h1_loss` 仍然可以直接比较
 
 ### 4.6 当前默认 loss 权重
 
@@ -324,6 +457,37 @@ token_prediction_weights: [1.0, 0.5, 0.25]
 - 实验二A下的 `token_h1_loss / token_h2_loss / token_h3_loss`
 - 实验二A下的 `token_h1_acc / token_h2_acc / token_h3_acc`
 
+其中：
+
+- `primary_loss` 统一定义为 `token_h1_loss`
+- 它对应“当前 step 的标准 next-token + EOS 预测损失”
+- 这是实验一和实验二A之间最适合横向比较的主指标
+- 每个 epoch 的 valid 生成样例 JSON
+
+除了 loss 和 TensorBoard 之外，验证阶段还会额外做少量真实生成预览。
+
+当前默认行为是：
+
+- 每个 epoch 在 valid loss 计算结束后
+- 额外抽取若干条 valid 样本
+- 用当前 codec 从 latent 自回归生成完整 step
+- 将 `prefix / gold step / predicted step / 是否正常生成到 EOS` 写入 JSON
+
+默认输出位置：
+
+```text
+outputs/<experiment_name>/valid_generations/epoch_001.json
+outputs/<experiment_name>/valid_generations/epoch_002.json
+...
+```
+
+JSON 的作用不是做正式打分，而是帮助你快速看：
+
+- 模型现在生成的 step 大概长什么样
+- 是否经常过早结束
+- 是否经常生成不出 `EOS`
+- 和 gold step 在表面上差多少
+
 TensorBoard 日志默认保存在各自实验目录下的：
 
 ```text
@@ -347,8 +511,76 @@ tensorboard --logdir outputs
 
 - step-level MTP objective
 - transition model initialization 对照
-- continuous vs discretized rollout
 - transfer
+
+但本轮会把 future transition 需要的 decoder interface 先补完整，也就是：
+
+- step token 训练时显式加入 `EOS`
+- 提供真正的 `latent -> autoregressive step generation` 接口
+- 为后续 discretized rollout 提前定义统一的 stop rule
+
+### 7.1 后续 generate 接口应该怎么做
+
+当后面需要把 codec 和 transition model 结合时，每一个 latent state `z_i` 不应该只 decode 出 1 个 token，而应该 decode 出完整的一个 reasoning step。
+
+生成流程统一定义为：
+
+1. 给定 `z_i`
+2. 不额外喂入 `BOS`
+3. 直接由 latent prefix 预测第一个 token
+4. 把新 token 追加回输入，继续自回归生成
+5. 如果生成到 `EOS`，当前 step 结束
+6. 如果一直未生成 `EOS`，则在 `max_step_tokens` 强制停止
+
+也就是说，真正的 step-level generation 终止条件是：
+
+- 首选 `EOS`
+- 其次是 `max_step_tokens` 兜底截断
+
+### 7.2 后续 discretized rollout 每一步怎么做
+
+未来若做离散 latent rollout，每一步统一按下面的过程：
+
+1. 从当前 prefix 编码得到 latent：
+
+```text
+z_i = Encoder(question + s_1 + ... + s_{i-1})
+```
+
+2. transition 预测下一 latent：
+
+```text
+\hat{z}_{i+1} = Transition(z_i)
+```
+
+3. 用 decoder 从 `\hat{z}_{i+1}` 自回归生成完整 step：
+
+```text
+\hat{s}_{i+1} = Decoder.generate_step(\hat{z}_{i+1})
+```
+
+其中生成从 latent 直接开始，到 `EOS` 结束。
+
+4. 把生成出的 `\hat{s}_{i+1}` 拼回 prefix：
+
+```text
+question + s_1 + ... + s_{i-1} + \hat{s}_{i+1}
+```
+
+5. 重新编码得到新的离散化 latent：
+
+```text
+z'_{i+1} = Encoder(question + s_1 + ... + s_{i-1} + \hat{s}_{i+1})
+```
+
+6. 再进入下一步 rollout
+
+这个接口和当前实验一、实验二A训练目标是一致的，因为训练时 decoder 已经学会：
+
+- 如何从 latent 直接开始生成一个 step
+- 如何在适当位置输出 `EOS`
+
+因此，后续 transition 接进来时，不需要再改 codec 训练口径。
 
 ## 8. 为什么先做实验一和实验二A
 

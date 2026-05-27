@@ -76,6 +76,7 @@ class TrainConfig:
     output_dir: str = "outputs/default"
     log_every: int = 20
     tensorboard_dir: str | None = None
+    valid_generate_examples: int = 8
     distributed_backend: str = "nccl"
 
 

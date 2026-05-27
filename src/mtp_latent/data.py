@@ -108,6 +108,7 @@ class ReasoningDataset(Dataset):
     def collate_fn(self, batch: list[ReasoningSample]) -> dict[str, torch.Tensor | list[str] | list[list[str]]]:
         prefix_batch = self.tokenizer(
             [sample.prefix_text for sample in batch],
+            add_special_tokens=False,
             padding=True,
             truncation=True,
             max_length=self.data_config.max_prefix_tokens,
@@ -115,6 +116,7 @@ class ReasoningDataset(Dataset):
         )
 
         target_steps: list[torch.Tensor] = []
+        target_labels: list[torch.Tensor] = []
         horizon_mask = torch.zeros((len(batch), self.data_config.max_horizon), dtype=torch.bool)
 
         for horizon in range(self.data_config.max_horizon):
@@ -128,26 +130,39 @@ class ReasoningDataset(Dataset):
 
             encoded = self.tokenizer(
                 step_texts,
+                add_special_tokens=False,
                 padding=True,
                 truncation=True,
-                max_length=max(self.data_config.max_step_tokens - 1, 1),
+                max_length=max(self.data_config.max_step_tokens - 1, 0),
                 return_tensors="pt",
             )
-            bos_column = torch.full(
-                (len(batch), 1),
-                self.tokenizer.bos_token_id,
+            step_tokens = torch.full(
+                (len(batch), encoded["input_ids"].size(1) + 1),
+                self.tokenizer.pad_token_id,
                 dtype=torch.long,
             )
-            step_tokens = torch.cat([bos_column, encoded["input_ids"]], dim=1)
+            step_labels = torch.full(
+                (len(batch), encoded["input_ids"].size(1) + 1),
+                -100,
+                dtype=torch.long,
+            )
             for row in range(len(batch)):
                 if not horizon_mask[row, horizon]:
-                    step_tokens[row, 1:] = self.tokenizer.pad_token_id
+                    continue
+                step_length = int(encoded["attention_mask"][row].sum().item())
+                if step_length > 0:
+                    step_tokens[row, :step_length] = encoded["input_ids"][row, :step_length]
+                    step_labels[row, :step_length] = encoded["input_ids"][row, :step_length]
+                step_tokens[row, step_length] = self.tokenizer.eos_token_id
+                step_labels[row, step_length] = self.tokenizer.eos_token_id
             target_steps.append(step_tokens)
+            target_labels.append(step_labels)
 
         return {
             "prefix_ids": prefix_batch["input_ids"],
             "prefix_mask": prefix_batch["attention_mask"].bool(),
             "target_steps": target_steps,
+            "target_labels": target_labels,
             "horizon_mask": horizon_mask,
             "prefix_texts": [sample.prefix_text for sample in batch],
             "future_texts": [sample.future_steps for sample in batch],

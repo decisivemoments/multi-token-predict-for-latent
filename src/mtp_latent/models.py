@@ -58,6 +58,13 @@ class ReasoningCodec(nn.Module):
     def decode(self, latent: torch.Tensor, target_tokens: torch.Tensor) -> torch.Tensor:
         return self.decode_multi_horizon(latent, target_tokens, [1])[1]
 
+    def _decode_hidden_states(self, latent: torch.Tensor, token_inputs: torch.Tensor) -> torch.Tensor:
+        token_embeddings = self.decoder.transformer.wte(token_inputs)
+        latent_prefix = self.decoder_latent_proj(latent).unsqueeze(1)
+        inputs_embeds = torch.cat([latent_prefix, token_embeddings], dim=1)
+        attention_mask = torch.ones(inputs_embeds.size()[:2], device=inputs_embeds.device, dtype=torch.long)
+        return self.decoder.transformer(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
+
     def decode_multi_horizon(
         self,
         latent: torch.Tensor,
@@ -65,11 +72,7 @@ class ReasoningCodec(nn.Module):
         token_horizons: list[int],
     ) -> dict[int, torch.Tensor]:
         token_inputs = target_tokens[:, :-1]
-        token_embeddings = self.decoder.transformer.wte(token_inputs)
-        latent_prefix = self.decoder_latent_proj(latent).unsqueeze(1)
-        inputs_embeds = torch.cat([latent_prefix, token_embeddings], dim=1)
-        attention_mask = torch.ones(inputs_embeds.size()[:2], device=inputs_embeds.device, dtype=torch.long)
-        hidden_states = self.decoder.transformer(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state[:, 1:, :]
+        hidden_states = self._decode_hidden_states(latent, token_inputs)
 
         logits_by_horizon: dict[int, torch.Tensor] = {}
         for horizon in token_horizons:
@@ -79,3 +82,51 @@ class ReasoningCodec(nn.Module):
                 head = self.future_token_heads[str(horizon)]
                 logits_by_horizon[horizon] = head(hidden_states)
         return logits_by_horizon
+
+    def next_token_logits(self, latent: torch.Tensor, decode_tokens: torch.Tensor) -> torch.Tensor:
+        hidden_states = self._decode_hidden_states(latent, decode_tokens)
+        return self.decoder.lm_head(hidden_states[:, -1, :])
+
+    def generate_step(
+        self,
+        latent: torch.Tensor,
+        eos_token_id: int,
+        max_new_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = latent.size(0)
+        decode_tokens = torch.empty((batch_size, 0), dtype=torch.long, device=latent.device)
+        generated_tokens: list[torch.Tensor] = []
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=latent.device)
+
+        for _ in range(max_new_tokens):
+            next_logits = self.next_token_logits(latent, decode_tokens)
+            next_token = next_logits.argmax(dim=-1)
+            next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
+            generated_tokens.append(next_token)
+            decode_tokens = torch.cat([decode_tokens, next_token.unsqueeze(1)], dim=1)
+            finished = finished | (next_token == eos_token_id)
+            if finished.all():
+                break
+
+        if generated_tokens:
+            generated = torch.stack(generated_tokens, dim=1)
+        else:
+            generated = torch.empty((batch_size, 0), dtype=torch.long, device=latent.device)
+        return generated, finished
+
+
+class LatentTransitionModel(nn.Module):
+    def __init__(self, latent_dim: int, hidden_dim: int, num_layers: int, dropout: float) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        input_dim = latent_dim
+        for _ in range(max(num_layers - 1, 0)):
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.GELU())
+            layers.append(nn.Dropout(dropout))
+            input_dim = hidden_dim
+        layers.append(nn.Linear(input_dim, latent_dim))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.network(latent)

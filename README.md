@@ -104,6 +104,14 @@ bash scripts/tensorboard_exp1.sh
 bash scripts/tensorboard_exp2a.sh
 ```
 
+每个 epoch 的 valid 生成样例会额外写到：
+
+```bash
+outputs/<experiment_name>/valid_generations/epoch_001.json
+```
+
+里面会保存 `prefix_text`、`target_step`、`predicted_step` 和 `finished_with_eos`，方便直接检查当前模型到底生成成什么样。
+
 ## 初始化与扩展
 
 - 当前阶段不训练 transition，也不做 step-level MTP objective。

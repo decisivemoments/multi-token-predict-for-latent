@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -54,11 +55,11 @@ def _write_metrics(writer: SummaryWriter | None, prefix: str, metrics: dict[str,
         writer.add_scalar(f"{prefix}/{key}", value, step)
 
 
-def _cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, pad_token_id: int) -> torch.Tensor:
+def _cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
     return nn.functional.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
         targets.reshape(-1),
-        ignore_index=pad_token_id,
+        ignore_index=ignore_index,
     )
 
 
@@ -93,7 +94,8 @@ def compute_codec_loss(
 
         for horizon, target_tokens in enumerate(batch["target_steps"]):
             target_tokens = target_tokens.to(device, non_blocking=True)
-            if target_tokens.size(1) <= 1:
+            target_labels = batch["target_labels"][horizon].to(device, non_blocking=True)
+            if target_tokens.size(1) == 0:
                 continue
             active = horizon_mask[:, horizon].float().mean()
             if active.item() == 0.0:
@@ -104,15 +106,14 @@ def compute_codec_loss(
 
             if objective_config.name == "standard":
                 logits = raw_codec.decode(latent, target_tokens)
-                targets = target_tokens[:, 1:]
-                sample_loss = _cross_entropy_loss(logits, targets, raw_codec.pad_token_id)
+                targets = target_labels
+                sample_loss = _cross_entropy_loss(logits, targets)
                 weight = objective_config.horizon_weights[min(horizon, len(objective_config.horizon_weights) - 1)]
                 losses.append(weight * sample_loss * active)
                 metrics["token_h1_loss"] = sample_loss.detach().item()
                 metrics["token_h1_acc"] = masked_token_accuracy(
                     logits.detach(),
                     targets.detach(),
-                    raw_codec.pad_token_id,
                 )
                 metrics["primary_loss"] = metrics["token_h1_loss"]
                 continue
@@ -120,7 +121,7 @@ def compute_codec_loss(
             if objective_config.name == "decoder_token_mtp":
                 token_horizons = objective_config.token_prediction_horizons
                 logits_by_horizon = raw_codec.decode_multi_horizon(latent, target_tokens, token_horizons)
-                base_targets = target_tokens[:, 1:]
+                base_targets = target_labels
 
                 for token_horizon in token_horizons:
                     logits = logits_by_horizon[token_horizon]
@@ -136,13 +137,12 @@ def compute_codec_loss(
                     weight = objective_config.token_prediction_weights[
                         min(token_horizon - 1, len(objective_config.token_prediction_weights) - 1)
                     ]
-                    sample_loss = _cross_entropy_loss(logits, targets, raw_codec.pad_token_id)
+                    sample_loss = _cross_entropy_loss(logits, targets)
                     losses.append(weight * sample_loss * active)
                     metrics[f"token_h{token_horizon}_loss"] = sample_loss.detach().item()
                     metrics[f"token_h{token_horizon}_acc"] = masked_token_accuracy(
                         logits.detach(),
                         targets.detach(),
-                        raw_codec.pad_token_id,
                     )
                 metrics["primary_loss"] = metrics["token_h1_loss"]
                 continue
@@ -184,6 +184,59 @@ def evaluate_codec(
     return EpochResult(loss=total_loss / max(count, 1), metrics=averaged)
 
 
+def _decode_generated_tokens(tokenizer, generated_token_ids: torch.Tensor) -> list[str]:
+    eos_id = tokenizer.eos_token_id
+    decoded: list[str] = []
+    for row in range(generated_token_ids.size(0)):
+        token_list = generated_token_ids[row].tolist()
+        if eos_id in token_list:
+            token_list = token_list[: token_list.index(eos_id)]
+        decoded.append(tokenizer.decode(token_list, skip_special_tokens=True).strip())
+    return decoded
+
+
+def _collect_valid_generations(
+    codec: ReasoningCodec,
+    loader,
+    config: ExperimentConfig,
+    device: torch.device,
+    max_examples: int,
+) -> list[dict[str, Any]]:
+    if max_examples <= 0:
+        return []
+    raw_codec = _unwrap_codec(codec)
+    tokenizer = loader.dataset.tokenizer
+    results: list[dict[str, Any]] = []
+    autocast_dtype = _autocast_dtype(config.train.precision) if device.type == "cuda" else None
+
+    with torch.no_grad():
+        for batch in loader:
+            prefix_ids = batch["prefix_ids"].to(device, non_blocking=True)
+            prefix_mask = batch["prefix_mask"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+                latent = raw_codec.encode(prefix_ids, prefix_mask)
+                generated_token_ids, finished = raw_codec.generate_step(
+                    latent,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=config.data.max_step_tokens,
+                )
+
+            predictions = _decode_generated_tokens(tokenizer, generated_token_ids)
+            current_targets = [future_steps[0] if future_steps else "" for future_steps in batch["future_texts"]]
+            for index, prediction in enumerate(predictions):
+                results.append(
+                    {
+                        "prefix_text": batch["prefix_texts"][index],
+                        "target_step": current_targets[index],
+                        "predicted_step": prediction,
+                        "finished_with_eos": bool(finished[index].item()),
+                    }
+                )
+                if len(results) >= max_examples:
+                    return results
+    return results
+
+
 def _maybe_wrap_ddp(codec: ReasoningCodec, dist_ctx: DistributedContext):
     if not dist_ctx.enabled:
         return codec
@@ -223,6 +276,7 @@ def train_codec(
     )
     output_dir = ensure_dir(config.train.output_dir)
     best_path = output_dir / "codec_best.pt"
+    valid_generation_dir = ensure_dir(output_dir / "valid_generations")
     history: dict[str, list[dict[str, float]]] = {"train": [], "valid": []}
     best_valid = float("inf")
     writer = _build_summary_writer(config, "codec", dist_ctx)
@@ -271,6 +325,25 @@ def train_codec(
             if dist_ctx.is_main_process:
                 history["train"].append({"loss": train_result.loss, **train_result.metrics})
                 history["valid"].append({"loss": valid_result.loss, **valid_result.metrics})
+                valid_generations = _collect_valid_generations(
+                    codec,
+                    loaders["valid"],
+                    config,
+                    device,
+                    config.train.valid_generate_examples,
+                )
+                save_json(
+                    valid_generation_dir / f"epoch_{epoch + 1:03d}.json",
+                    {
+                        "epoch": epoch + 1,
+                        "experiment_name": config.experiment_name,
+                        "valid_loss": valid_result.loss,
+                        "valid_metrics": valid_result.metrics,
+                        "samples": valid_generations,
+                    },
+                )
+            if dist_ctx.enabled:
+                dist.barrier()
             if writer is not None:
                 writer.add_scalar("train/epoch_loss", train_result.loss, epoch + 1)
                 writer.add_scalar("valid/loss", valid_result.loss, epoch + 1)
