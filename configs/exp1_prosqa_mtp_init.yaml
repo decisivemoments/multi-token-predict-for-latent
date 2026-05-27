@@ -10,7 +10,7 @@ data:
   max_step_tokens: 64
   max_horizon: 1
   batch_size: 16
-  num_workers: 0
+  num_workers: 8
   text_separator: "\n"
   drop_empty_steps: true
 model:
@@ -31,12 +31,14 @@ codec_objective:
   name: standard
   horizon_weights: [1.0]
 train:
-  epochs: 2
+  epochs: 5
   learning_rate: 0.0003
   weight_decay: 0.01
   grad_clip_norm: 1.0
   seed: 42
   device: cuda:2
+  precision: bf16
+  allow_tf32: true
   output_dir: outputs/exp1_prosqa_mtp_init
   tensorboard_dir: outputs/exp1_prosqa_mtp_init/tensorboard
   log_every: 20

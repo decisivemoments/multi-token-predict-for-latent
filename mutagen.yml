@@ -20,7 +20,7 @@ sync:
         - "*.bin"
         - "*.safetensors"
         - "mutagen.yml"
-        - "mutagen.lock"
+        - "mutagen.yml.lock"
   codebase:
     alpha: .
     beta: "jyzhang@10.176.34.113:/home/jyzhang/pro/multi-token-predict-for-latent"

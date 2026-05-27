@@ -20,6 +20,9 @@ class DataConfig:
     max_horizon: int = 1
     batch_size: int = 8
     num_workers: int = 0
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int | None = 2
     text_separator: str = "\n"
     drop_empty_steps: bool = True
 
@@ -36,6 +39,7 @@ class ModelConfig:
     n_layer: int = 4
     n_head: int = 4
     n_positions: int = 512
+    max_token_mtp_horizon: int = 1
     dropout: float = 0.1
     init_source: str = "ntp"
     init_checkpoint: str | None = None
@@ -45,6 +49,8 @@ class ModelConfig:
 class CodecObjectiveConfig:
     name: str = "standard"
     horizon_weights: list[float] = field(default_factory=lambda: [1.0])
+    token_prediction_horizons: list[int] = field(default_factory=lambda: [1])
+    token_prediction_weights: list[float] = field(default_factory=lambda: [1.0])
     teacher_forcing: bool = True
 
 
@@ -65,6 +71,8 @@ class TrainConfig:
     grad_clip_norm: float = 1.0
     seed: int = 42
     device: str = "auto"
+    precision: str = "bf16"
+    allow_tf32: bool = True
     output_dir: str = "outputs/default"
     log_every: int = 20
     tensorboard_dir: str | None = None
@@ -83,7 +91,7 @@ class ExperimentConfig:
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ExperimentConfig":
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-        return cls(
+        config = cls(
             experiment_name=raw["experiment_name"],
             data=DataConfig(**raw["data"]),
             model=ModelConfig(**raw["model"]),
@@ -91,6 +99,28 @@ class ExperimentConfig:
             transition=TransitionConfig(**raw.get("transition", {})),
             train=TrainConfig(**raw.get("train", {})),
         )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        if len(self.codec_objective.horizon_weights) == 0:
+            raise ValueError("codec_objective.horizon_weights must not be empty.")
+
+        if self.codec_objective.name == "decoder_token_mtp":
+            horizons = self.codec_objective.token_prediction_horizons
+            weights = self.codec_objective.token_prediction_weights
+            if not horizons:
+                raise ValueError("decoder_token_mtp requires token_prediction_horizons.")
+            if horizons[0] != 1:
+                raise ValueError("decoder_token_mtp requires token_prediction_horizons to start from 1.")
+            if any(horizon < 1 for horizon in horizons):
+                raise ValueError("token_prediction_horizons must be positive integers.")
+            if len(weights) < len(horizons):
+                raise ValueError("token_prediction_weights must cover every token_prediction_horizon.")
+            if max(horizons) > self.model.max_token_mtp_horizon:
+                raise ValueError("model.max_token_mtp_horizon is smaller than codec_objective.token_prediction_horizons.")
+            if self.data.max_horizon != 1:
+                raise ValueError("decoder_token_mtp is only defined for data.max_horizon == 1 in experiment 2A.")
 
     def dump_dict(self) -> dict[str, Any]:
         return {

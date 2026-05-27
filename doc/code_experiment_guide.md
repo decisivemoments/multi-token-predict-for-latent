@@ -320,6 +320,7 @@ token_prediction_weights: [1.0, 0.5, 0.25]
 
 - `train loss curve`
 - `valid loss curve`
+- `primary_loss`
 - 实验二A下的 `token_h1_loss / token_h2_loss / token_h3_loss`
 - 实验二A下的 `token_h1_acc / token_h2_acc / token_h3_acc`
 

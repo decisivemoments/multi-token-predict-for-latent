@@ -170,14 +170,23 @@ def build_dataloaders(
     valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
 
+    persistent_workers = data_config.persistent_workers and data_config.num_workers > 0
+    loader_kwargs = {
+        "num_workers": data_config.num_workers,
+        "collate_fn": train_dataset.collate_fn,
+        "pin_memory": data_config.pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if data_config.num_workers > 0 and data_config.prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = data_config.prefetch_factor
+
     loaders = {
         "train": DataLoader(
             train_dataset,
             batch_size=data_config.batch_size,
             shuffle=train_sampler is None,
             sampler=train_sampler,
-            num_workers=data_config.num_workers,
-            collate_fn=train_dataset.collate_fn,
+            **loader_kwargs,
         ),
         "valid": DataLoader(
             valid_dataset,
@@ -186,6 +195,9 @@ def build_dataloaders(
             sampler=valid_sampler,
             num_workers=data_config.num_workers,
             collate_fn=valid_dataset.collate_fn,
+            pin_memory=data_config.pin_memory,
+            persistent_workers=persistent_workers,
+            **({"prefetch_factor": data_config.prefetch_factor} if data_config.num_workers > 0 and data_config.prefetch_factor is not None else {}),
         ),
         "test": DataLoader(
             test_dataset,
@@ -194,6 +206,9 @@ def build_dataloaders(
             sampler=test_sampler,
             num_workers=data_config.num_workers,
             collate_fn=test_dataset.collate_fn,
+            pin_memory=data_config.pin_memory,
+            persistent_workers=persistent_workers,
+            **({"prefetch_factor": data_config.prefetch_factor} if data_config.num_workers > 0 and data_config.prefetch_factor is not None else {}),
         ),
     }
     return train_dataset, loaders, tokenizer

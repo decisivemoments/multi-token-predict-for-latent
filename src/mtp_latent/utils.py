@@ -56,6 +56,14 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def configure_torch_runtime(device: torch.device, allow_tf32: bool) -> None:
+    if device.type != "cuda":
+        return
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+    torch.backends.cudnn.benchmark = True
+
+
 class DistributedContext:
     def __init__(self, enabled: bool, rank: int, local_rank: int, world_size: int, device: torch.device) -> None:
         self.enabled = enabled

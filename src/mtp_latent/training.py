@@ -13,7 +13,16 @@ from tqdm import tqdm
 from mtp_latent.config import CodecObjectiveConfig, ExperimentConfig
 from mtp_latent.metrics import cosine_retrieval_metrics, masked_token_accuracy
 from mtp_latent.models import ReasoningCodec
-from mtp_latent.utils import DistributedContext, cleanup_distributed, distributed_mean, distributed_sum_dict, ensure_dir, init_distributed, save_json
+from mtp_latent.utils import (
+    DistributedContext,
+    cleanup_distributed,
+    configure_torch_runtime,
+    distributed_mean,
+    distributed_sum_dict,
+    ensure_dir,
+    init_distributed,
+    save_json,
+)
 
 
 @dataclass
@@ -53,43 +62,92 @@ def _cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, pad_token_i
     )
 
 
+def _autocast_dtype(precision: str) -> torch.dtype | None:
+    if precision == "fp32":
+        return None
+    if precision == "fp16":
+        return torch.float16
+    if precision == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported train.precision={precision}")
+
+
 def compute_codec_loss(
     codec: ReasoningCodec,
     batch: dict[str, torch.Tensor | list[str] | list[list[str]]],
     objective_config: CodecObjectiveConfig,
     device: torch.device,
+    precision: str = "fp32",
 ) -> tuple[torch.Tensor, dict[str, float]]:
     raw_codec = _unwrap_codec(codec)
-    prefix_ids = batch["prefix_ids"].to(device)
-    prefix_mask = batch["prefix_mask"].to(device)
-    horizon_mask = batch["horizon_mask"].to(device)
-    latent = raw_codec.encode(prefix_ids, prefix_mask)
+    prefix_ids = batch["prefix_ids"].to(device, non_blocking=True)
+    prefix_mask = batch["prefix_mask"].to(device, non_blocking=True)
+    horizon_mask = batch["horizon_mask"].to(device, non_blocking=True)
+    autocast_dtype = _autocast_dtype(precision) if device.type == "cuda" else None
 
     losses: list[torch.Tensor] = []
     metrics: dict[str, float] = {}
 
-    for horizon, target_tokens in enumerate(batch["target_steps"]):
-        target_tokens = target_tokens.to(device)
-        if target_tokens.size(1) <= 1:
-            continue
-        logits = raw_codec.decode(latent, target_tokens)
-        targets = target_tokens[:, 1:]
-        sample_loss = _cross_entropy_loss(logits, targets, raw_codec.pad_token_id)
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+        latent = raw_codec.encode(prefix_ids, prefix_mask)
 
-        active = horizon_mask[:, horizon].float().mean()
-        if active.item() == 0.0:
-            continue
+        for horizon, target_tokens in enumerate(batch["target_steps"]):
+            target_tokens = target_tokens.to(device, non_blocking=True)
+            if target_tokens.size(1) <= 1:
+                continue
+            active = horizon_mask[:, horizon].float().mean()
+            if active.item() == 0.0:
+                continue
 
-        if objective_config.name == "standard" and horizon > 0:
-            continue
+            if horizon > 0:
+                continue
 
-        weight = objective_config.horizon_weights[min(horizon, len(objective_config.horizon_weights) - 1)]
-        losses.append(weight * sample_loss * active)
-        metrics[f"h{horizon + 1}_token_acc"] = masked_token_accuracy(
-            logits.detach(),
-            targets.detach(),
-            raw_codec.pad_token_id,
-        )
+            if objective_config.name == "standard":
+                logits = raw_codec.decode(latent, target_tokens)
+                targets = target_tokens[:, 1:]
+                sample_loss = _cross_entropy_loss(logits, targets, raw_codec.pad_token_id)
+                weight = objective_config.horizon_weights[min(horizon, len(objective_config.horizon_weights) - 1)]
+                losses.append(weight * sample_loss * active)
+                metrics["token_h1_loss"] = sample_loss.detach().item()
+                metrics["token_h1_acc"] = masked_token_accuracy(
+                    logits.detach(),
+                    targets.detach(),
+                    raw_codec.pad_token_id,
+                )
+                metrics["primary_loss"] = metrics["token_h1_loss"]
+                continue
+
+            if objective_config.name == "decoder_token_mtp":
+                token_horizons = objective_config.token_prediction_horizons
+                logits_by_horizon = raw_codec.decode_multi_horizon(latent, target_tokens, token_horizons)
+                base_targets = target_tokens[:, 1:]
+
+                for token_horizon in token_horizons:
+                    logits = logits_by_horizon[token_horizon]
+                    offset = token_horizon - 1
+                    if offset > 0:
+                        if logits.size(1) <= offset:
+                            continue
+                        logits = logits[:, :-offset, :]
+                        targets = base_targets[:, offset:]
+                    else:
+                        targets = base_targets
+
+                    weight = objective_config.token_prediction_weights[
+                        min(token_horizon - 1, len(objective_config.token_prediction_weights) - 1)
+                    ]
+                    sample_loss = _cross_entropy_loss(logits, targets, raw_codec.pad_token_id)
+                    losses.append(weight * sample_loss * active)
+                    metrics[f"token_h{token_horizon}_loss"] = sample_loss.detach().item()
+                    metrics[f"token_h{token_horizon}_acc"] = masked_token_accuracy(
+                        logits.detach(),
+                        targets.detach(),
+                        raw_codec.pad_token_id,
+                    )
+                metrics["primary_loss"] = metrics["token_h1_loss"]
+                continue
+
+            raise ValueError(f"Unsupported codec objective: {objective_config.name}")
 
     if not losses:
         raise ValueError("No active losses were produced for the current batch.")
@@ -109,7 +167,7 @@ def evaluate_codec(
 
     with torch.no_grad():
         for batch in loader:
-            loss, metrics = compute_codec_loss(codec, batch, config.codec_objective, device)
+            loss, metrics = compute_codec_loss(codec, batch, config.codec_objective, device, config.train.precision)
             total_loss += loss.item()
             count += 1
             for key, value in metrics.items():
@@ -153,6 +211,7 @@ def train_codec(
 ) -> Path:
     dist_ctx = init_distributed(config.train.device, config.train.distributed_backend)
     device = dist_ctx.device
+    configure_torch_runtime(device, config.train.allow_tf32)
     if config.model.init_checkpoint:
         raise ValueError("Experiment 1 only supports initialization via model.model_name_or_path. Leave model.init_checkpoint empty.")
     codec.to(device)
@@ -180,8 +239,8 @@ def train_codec(
             steps_in_epoch = 0
 
             for step, batch in enumerate(progress, start=1):
-                optimizer.zero_grad()
-                loss, metrics = compute_codec_loss(codec, batch, config.codec_objective, device)
+                optimizer.zero_grad(set_to_none=True)
+                loss, metrics = compute_codec_loss(codec, batch, config.codec_objective, device, config.train.precision)
                 loss.backward()
                 _clip_grad_norm(codec, config.train.grad_clip_norm)
                 optimizer.step()
