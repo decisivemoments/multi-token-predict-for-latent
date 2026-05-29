@@ -13,6 +13,7 @@
 
 - 实验一：`standard` objective
 - 实验二A：`decoder_token_mtp` objective
+- 实验三当前版本：`transition model + next_type(step/answer) + frozen decoder supervision`
 
 ## 数据格式
 
@@ -60,8 +61,9 @@ pip install -r requirements.txt
 - `decode`: 把 latent 投影成一个 prefix embedding，拼到 GPT-2 decoder 输入前面
 - `train.device`: 支持 `auto`、`cuda`、`cuda:0`、`cpu`
 - `torchrun + DDP`: 支持多卡并行；单卡命令语义保持不变
+- `train-transition`: 支持基于冻结 codec 的 transition 训练
 
-在服务器上先把对应 YAML 里的 `model.model_name_or_path` 改成实际模型路径。
+在服务器上先把对应 YAML 里的 `model.tokenizer_name_or_path` 和 `model.model_name_or_path` 改成实际模型路径。transition 训练同时还要求 `transition.codec_checkpoint` 指向实验一或实验二A输出的 `codec_best.pt`。
 
 实验一配置：
 
@@ -102,6 +104,7 @@ bash scripts/train_exp2a_gsm_mtp_init.sh
 ```bash
 bash scripts/tensorboard_exp1.sh
 bash scripts/tensorboard_exp2a.sh
+bash scripts/tensorboard_exp3.sh
 ```
 
 每个 epoch 的 valid 生成样例会额外写到：
@@ -110,12 +113,41 @@ bash scripts/tensorboard_exp2a.sh
 outputs/<experiment_name>/valid_generations/epoch_001.json
 ```
 
-里面会保存 `prefix_text`、`target_step`、`predicted_step` 和 `finished_with_eos`，方便直接检查当前模型到底生成成什么样。
+里面会保存 `prefix_text`、`target_kind`、`target_text`、`predicted_text`、`finished_with_eos` 和 `answer_correct`。同时，`valid_metrics` 里会额外包含 `answer_acc`，方便直接看 answer 样本上的生成准确率。
+
+transition 训练完成后，也会额外写：
+
+```bash
+outputs/<experiment_name>/transition_valid_generations/epoch_001.json
+```
+
+里面会保存两类内容：
+
+- `samples`：position-level teacher-forcing 检查，包含 `gold_type`、`predicted_type`、`gold_text`、`predicted_text` 和 `finished_with_eos`
+- `rollout_samples`：question-only rollout 检查，包含
+  - `teacher_forced_answer_prediction`
+  - `rollout_direct`
+  - `rollout_reencode`
+
+transition valid 现在还会额外记录三类 answer 指标：
+
+- `teacher_forced_answer_acc`
+- `rollout_direct_answer_acc`
+- `rollout_reencode_answer_acc`
+
+以及对应的 `*_answer_stop_rate`，用来衡量 rollout 时模型有没有真的切换到 `answer`。
+
+transition 训练的初始化口径现在是固定的：
+
+- frozen codec 总是从 `transition.codec_checkpoint` 加载
+- transition backbone 总是从 `model.model_name_or_path` 加载预训练 GPT-2
+- `transition.init_checkpoint` 只用于恢复一个已经训练中的 transition checkpoint
 
 ## 初始化与扩展
 
-- 当前阶段不训练 transition，也不做 step-level MTP objective。
-- 实验一和实验二A都固定 `max_horizon=1`，只预测当前 step。
+- 当前阶段已经支持 codec 训练和 transition 训练，但还没有实现 step-level MTP objective。
+- codec 训练当前会把 `answer` 也作为 trace 的最后一个 target。
+- 实验一和实验二A都固定 `max_horizon=1`，只预测当前 target。
 - 实验二A额外在 decoder hidden state 上预测 `current token / next token / next next token`。
 - 当前最重要的结果是各组实验的 `train loss`、`valid loss` 和 token-horizon 指标 TensorBoard 曲线。
 

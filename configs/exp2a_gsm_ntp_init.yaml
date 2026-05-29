@@ -3,9 +3,6 @@ data:
   train_path: dataset/gsm_train.json
   valid_path: dataset/gsm_valid.json
   test_path: dataset/gsm_test.json
-  train_max_records:
-  valid_max_records:
-  test_max_records:
   max_prefix_tokens: 256
   max_step_tokens: 64
   max_horizon: 1
@@ -15,8 +12,8 @@ data:
   drop_empty_steps: true
 model:
   backbone_type: gpt2
-  tokenizer_name_or_path: gpt2
-  model_name_or_path: /home/jyzhang/download/gpt2-self-ntp
+  tokenizer_name_or_path: /inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model/gpt2-self-ntp
+  model_name_or_path: /inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model/gpt2-self-ntp
   vocab_size: 50257
   embedding_dim: 256
   hidden_dim: 256
@@ -27,7 +24,6 @@ model:
   max_token_mtp_horizon: 3
   dropout: 0.1
   init_source: ntp
-  init_checkpoint:
 codec_objective:
   name: decoder_token_mtp
   horizon_weights: [1.0]

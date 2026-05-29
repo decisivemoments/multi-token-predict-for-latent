@@ -582,6 +582,43 @@ z'_{i+1} = Encoder(question + s_1 + ... + s_{i-1} + \hat{s}_{i+1})
 
 因此，后续 transition 接进来时，不需要再改 codec 训练口径。
 
+### 7.3 当前 codec 还缺 answer supervision
+
+当前 codec 只覆盖了 reasoning step 的生成监督：
+
+- `question -> s_1`
+- `question + s_1 -> s_2`
+- ...
+- `question + s_1 + ... + s_{n-1} -> s_n`
+
+但完整题目还差最后一步：
+
+```text
+question + s_1 + ... + s_n -> answer
+```
+
+因此如果后面要把整条题的生成链条做完整，codec 也必须把 `answer` 纳入 target。
+
+统一后的完整 trace 应该写成：
+
+```text
+question
+s_1
+s_2
+...
+s_n
+answer
+```
+
+这样 codec 最后一个 prefix-target pair 就是：
+
+```text
+prefix = question + s_1 + ... + s_n
+target = answer
+```
+
+后面 transition model 的设计也会沿用同样的“最后一个目标是 answer”的定义。
+
 ## 8. 为什么先做实验一和实验二A
 
 因为当前最重要的是先把下面这件事做干净：
@@ -606,7 +643,405 @@ z'_{i+1} = Encoder(question + s_1 + ... + s_{i-1} + \hat{s}_{i+1})
 
 只要实验一和实验二A的变量都稳定了，后面再加实验二B和 transition 才是合理的。
 
-## 10. 一键运行脚本
+## 10. Transition Model 设计
+
+下面这部分先固定实现口径，暂时还不展开实验脚本。
+
+### 10.1 transition model 要解决什么问题
+
+codec 训练完成并冻结之后，每个 gold reasoning trace 都可以得到一串 prefix latent：
+
+```text
+z_1 = Encoder(question)
+z_2 = Encoder(question + s_1)
+z_3 = Encoder(question + s_1 + s_2)
+...
+z_k = Encoder(question + s_1 + ... + s_{k-1})
+```
+
+这里 `z_i` 的语义是：
+
+- 它表示“看到 question 和前 `i-1` 个 step 之后的状态”
+- 它对应的下一个 gold step 是 `s_i`
+
+因此 transition model 的目标不是单纯做：
+
+```text
+z_i -> z_{i+1}
+```
+
+而是学一个更强的、可 rollout 的 causal predictor：
+
+- 先从 question token 序列推出 `s_1`
+- 再从 `question + z_1` 推出 `s_2`
+- 再从 `question + z_1 + z_2` 推出 `s_3`
+- 以此类推
+
+如果把整条题做完整，还需要再补一项：
+
+- 从最后一个 reasoning latent 推出 `answer`
+
+### 10.2 训练输入如何组织
+
+给定一个样本：
+
+```text
+question = q_1, q_2, ..., q_n
+steps = s_1, s_2, ..., s_m
+```
+
+先用冻结的 codec encoder 构造：
+
+```text
+z_1 = Encoder(question)
+z_2 = Encoder(question + s_1)
+...
+z_{m-1} = Encoder(question + s_1 + ... + s_{m-2})
+z_m = Encoder(question + s_1 + ... + s_{m-1})
+```
+
+然后 transition model 的一条训练序列定义成：
+
+```text
+[q_1, q_2, ..., q_n, z_1, z_2, ..., z_m]
+```
+
+也就是说：
+
+- question 部分用离散 token
+- reasoning history 部分用连续 latent token
+
+这是一个 mixed sequence。
+
+### 10.3 哪些位置有监督
+
+不是整条序列每个位置都要监督。
+
+当前定义是：
+
+- `q_1 ... q_{n-1}` 没有 step supervision
+- `q_n` 的 last hidden state 负责预测 `s_1`
+- `z_1` 的 last hidden state 负责预测 `s_2`
+- `z_2` 的 last hidden state 负责预测 `s_3`
+- ...
+- `z_{m-1}` 的 last hidden state 负责预测 `s_m`
+- `z_m` 的 last hidden state 负责预测 `answer`
+
+因此监督位置集合是：
+
+```text
+[q_n, z_1, z_2, ..., z_m]
+```
+
+监督目标集合是：
+
+```text
+[s_1, s_2, s_3, ..., s_m, answer]
+```
+
+这和 latent 的定义是严格对齐的：
+
+- `q_n` 看到了完整 question，所以它对应“第一个要生成的 step”
+- `z_1` 表示看到 question 之后的第一个 latent state，因此它对应“第二个要生成的 step”
+- `z_i` 表示看到前 `i-1` 个 gold steps 之后的状态，因此它对应 `s_{i+1}`
+- `z_m` 表示已经看到全部 reasoning steps，因此它对应最终 `answer`
+
+### 10.4 transition backbone 具体长什么样
+
+第一版实现直接使用一个 GPT-2 style causal transformer 作为 transition backbone，并且它的参数初始化来自 `model.model_name_or_path` 指向的预训练 GPT-2 权重，而不是随机初始化。
+
+它的输入嵌入由两部分组成：
+
+1. question token embedding
+2. latent token embedding
+
+更具体地说：
+
+- 对 `q_1 ... q_n`，使用 transition backbone 自己的 token embedding
+- 对 `z_i`，先用一个线性层把 `latent_dim` 投到 backbone hidden size，再把它当成一个连续 token embedding 喂进去
+
+因此需要两个附加投影：
+
+```text
+latent_in_proj: latent_dim -> transition_hidden_dim
+latent_out_proj: transition_hidden_dim -> latent_dim
+```
+
+其中：
+
+- `latent_in_proj` 用于把 codec latent 放进 transition transformer
+- `latent_out_proj` 用于把 transition 某个位置的 hidden state 再投回 decoder 可接受的 latent 空间
+
+### 10.5 监督信号怎么施加
+
+这是这一部分最关键的实现细节。
+
+设 transition backbone 在监督位置产生 hidden state：
+
+```text
+h(q_n), h(z_1), h(z_2), ..., h(z_m)
+```
+
+先经过：
+
+```text
+u_1 = latent_out_proj(h(q_n))
+u_2 = latent_out_proj(h(z_1))
+u_3 = latent_out_proj(h(z_2))
+...
+u_m = latent_out_proj(h(z_{m-1}))
+u_{m+1} = latent_out_proj(h(z_m))
+```
+
+然后把这些 `u_i` 当成“预测得到的 latent state”，交给**冻结的 codec decoder** 去 decode。
+
+也就是：
+
+```text
+Decoder(u_1) -> s_1
+Decoder(u_2) -> s_2
+...
+Decoder(u_m) -> s_m
+Decoder(u_{m+1}) -> answer
+```
+
+训练 loss 不是直接对 hidden state 做 MSE，而是：
+
+- 用 codec decoder 对每个 `u_i` 做 teacher-forcing step generation
+- 对应 gold step token 序列算 cross-entropy
+
+因此 transition model 的主监督是：
+
+```text
+transition hidden state
+-> latent_out_proj
+-> frozen decoder
+-> token CE loss on gold step
+```
+
+第一版实现里，这个 decode loss 就作为 transition 的主 loss。
+
+### 10.6 trace-level completion 应该怎么做
+
+这里要明确区分两种“结束”：
+
+1. `step-level EOS`
+- 它只表示当前一条文本结束
+- 可能是一条 reasoning step 结束
+- 也可能是 final answer 文本结束
+
+2. `trace-level completion`
+- 它表示整道题的 reasoning trace 是否已经走到“该输出 final answer”的阶段
+- 它不是 decoder 文本 token
+- 它是 rollout 控制信号
+
+第一版建议把 trace-level completion 做成一个显式的二分类头：
+
+```text
+next_type_head(h) -> {step, answer}
+```
+
+也就是对每个监督位置，同时预测：
+
+1. 下一个要 decode 的对象类型
+2. 下一个要 decode 的文本内容
+
+具体标签定义如下：
+
+```text
+q_n      -> next_type = step,   next_text = s_1
+z_1      -> next_type = step,   next_text = s_2
+...
+z_{m-1}  -> next_type = step,   next_text = s_m
+z_m      -> next_type = answer, next_text = answer
+```
+
+这个定义的关键点是：
+
+- trace-level completion 不表示“现在什么都不生成，直接停掉”
+- 它表示“下一次 decode 的目标类型从 reasoning step 切换成 final answer”
+- 一旦 `next_type = answer`，系统就用 decoder 生成 answer 文本
+- answer 文本生成到 step-level `EOS` 后，整条题结束
+
+### 10.7 transition 的训练 loss
+
+基于上面的定义，transition 每个监督位置都有两类损失：
+
+1. `type loss`
+
+```text
+L_type = CE(next_type_logits, next_type_label)
+```
+
+2. `decode loss`
+
+- 如果 `next_type_label = step`，就 decode 到对应 `s_i`
+- 如果 `next_type_label = answer`，就 decode 到对应 `answer`
+
+也就是：
+
+```text
+L_decode = frozen_decoder_CE(predicted_latent_like_state, target_text)
+```
+
+第一版总 loss 建议直接写成：
+
+```text
+L = L_type + L_decode
+```
+
+### 10.8 为什么第一版先不用 latent regression
+
+还有一种更传统的做法是：
+
+```text
+T(z_i) -> z_{i+1}
+```
+
+然后直接对 `z_{i+1}` 做回归或相似度 loss。
+
+这条路当然也可以做，但第一版不作为主实现，原因是：
+
+1. 你的需求里更强调“某个位置的 hidden state 是否真的能解码成正确下一 step”
+2. decoder-based supervision 更接近最终我们关心的可读 reasoning state
+3. 这样更容易直接检查 transition hidden state 是否仍在 decoder-readable manifold 上
+
+后面如果要增强训练稳定性，可以再加辅助项：
+
+- latent regression loss
+- contrastive retrieval loss
+
+但第一版先不混进来。
+
+### 10.9 一个完整例子
+
+设样本是：
+
+```text
+question: "Tom bought his games for $200. They tripled in value and he then sold 40% of them. How much did he sell the games for?"
+
+s_1 = "<<200*3=600>>"
+s_2 = "<<600*.4=240>>"
+answer = "240"
+```
+
+那么：
+
+```text
+z_1 = Encoder(question)
+z_2 = Encoder(question + s_1)
+```
+
+因为这里只有两个 steps，所以 transition 训练序列是：
+
+```text
+[q_1, q_2, ..., q_n, z_1, z_2]
+```
+
+监督位置和目标是：
+
+```text
+q_n  -> type=step,   target=s_1
+z_1  -> type=step,   target=s_2
+z_2  -> type=answer, target=answer
+```
+
+具体 forward 过程是：
+
+1. 把 `question` token embedding 输入 transition backbone
+2. 把 `z_1, z_2` 经过 `latent_in_proj` 作为连续 token 接到 question 后面
+3. 用 causal attention 跑完整条序列
+4. 取 `q_n` 位置 hidden state，投影成 `u_1`
+5. 取 `z_1` 位置 hidden state，投影成 `u_2`
+6. 取 `z_2` 位置 hidden state，投影成 `u_3`
+7. 用 `next_type_head` 分类：
+
+```text
+q_n -> step
+z_1 -> step
+z_2 -> answer
+```
+
+8. 用冻结 decoder：
+
+```text
+Decoder(u_1) 监督到 "<<200*3=600>>"
+Decoder(u_2) 监督到 "<<600*.4=240>>"
+Decoder(u_3) 监督到 "240"
+```
+
+9. 三个 decode CE loss 加上三个 type CE loss，求和或求平均，作为这条样本的 transition loss
+
+### 10.10 训练时使用 gold latent，rollout 时使用 predicted latent
+
+transition 训练阶段先采用 teacher-forcing 口径：
+
+- question token 用 gold
+- latent token `z_i` 也用 gold codec encoder 提取结果
+
+也就是说，训练时输入的是：
+
+```text
+[q_1, ..., q_n, z_1^{gold}, z_2^{gold}, ...]
+```
+
+这样先保证 transition backbone 学会在“正确历史”条件下预测下一 step。
+
+到了 rollout / inference 阶段，再切成：
+
+- 第一个监督位置先用 `next_type_head` 判断下一项是 `step` 还是 `answer`
+- 如果是 `step`，就 decode 出 `\hat{s}_1`
+- 再把 `\hat{s}_1` 重新 encode 成 `\hat{z}_1`
+- 再把 `\hat{z}_1` 接回 sequence，继续预测下一项
+- 如果某一步 `next_type_head` 判成 `answer`，就 decode 出 `\hat{answer}`
+- `\hat{answer}` 生成到 step-level `EOS` 后，整条题结束
+
+所以：
+
+- 训练是 gold latent teacher forcing
+- 推理是 predicted latent autoregressive rollout
+
+第一版实现先把训练接口做稳定，rollout 作为下一步单独接。
+
+### 10.11 当前这版 transition 实现边界
+
+为了先把接口做干净，第一版 transition 建议保持下面这些限制：
+
+1. codec encoder 和 codec decoder 冻结
+2. transition model 单独训练
+3. 主 loss 用 `type CE + decoder CE`
+4. 不先混入 latent MSE / cosine / contrastive 辅助 loss
+5. 不先做 multi-step scheduled sampling
+
+这样我们先回答一个最干净的问题：
+
+> 不同 codec 产生的 latent state，是否会影响 transition backbone 学出可 decode 的下一 step state？
+
+以及：
+
+> transition backbone 是否能学会在合适的时候把“下一项类型”从 reasoning step 切换成 final answer？
+
+当前实现中的初始化口径固定为：
+
+- `transition.codec_checkpoint`：加载实验一或实验二A训练完成后保存的 codec `pt`，恢复 frozen encoder-decoder
+- `model.model_name_or_path`：加载预训练 GPT-2，作为 transition backbone 的初始化
+- `transition.init_checkpoint`：只保留给“继续训练已有 transition checkpoint”的场景，不用于第一轮实验初始化
+
+当前实现中的 transition 数据准备口径固定为：
+
+- dataloader 初始化阶段不再预先把全量 prefix 过一遍 codec encoder
+- dataset 只保存 `question_text`、每个 latent 对应的 `prefix_text`、以及对应的 target 文本
+- 训练和验证时，在每个 batch 内部用 frozen codec encoder 现算该 batch 的 `z_1 ... z_m`
+
+这样训练启动后会立刻进入 epoch 和 step 日志，不会先卡在一段长时间的全量 latent 预处理上。
+
+等这部分跑通之后，再逐步加：
+
+- rollout evaluation
+- latent regression 辅助项
+- experiment 3 / 4 的完整脚本
+
+## 11. 一键运行脚本
 
 当前已经补好的实验一脚本是：
 
@@ -627,13 +1062,44 @@ TensorBoard 查看脚本：
 - `scripts/train_exp2a_gsm_ntp_init.sh`
 - `scripts/train_exp2a_gsm_mtp_init.sh`
 
+transition 训练脚本：
+
+- `scripts/train_exp3_transition_exp1_prosqa_ntp.sh`
+- `scripts/train_exp3_transition_exp1_prosqa_mtp.sh`
+- `scripts/train_exp3_transition_exp1_gsm_ntp.sh`
+- `scripts/train_exp3_transition_exp1_gsm_mtp.sh`
+- `scripts/train_exp3_transition_exp2a_prosqa_ntp.sh`
+- `scripts/train_exp3_transition_exp2a_prosqa_mtp.sh`
+- `scripts/train_exp3_transition_exp2a_gsm_ntp.sh`
+- `scripts/train_exp3_transition_exp2a_gsm_mtp.sh`
+
 推荐使用方式：
 
-1. 先修改四个 YAML 中的模型路径
-2. 在服务器上直接运行对应脚本
-3. 训练结束后用 TensorBoard 查看 `outputs/` 下的曲线
+1. 先修改 YAML 中的 `model.tokenizer_name_or_path` 和 `model.model_name_or_path`
+2. 确认 `transition.codec_checkpoint` 指向实验一或实验二A训练产出的 `codec_best.pt`
+3. 在服务器上直接运行对应脚本
+4. 训练结束后用 TensorBoard 查看 `outputs/` 下的曲线
 
 补充说明：
 
-- 当前 CLI 只保留 `train-codec`、`evaluate`、`inspect-data`、`show-history`
-- 当前实验一 YAML 不再显式携带 transition 配置块
+- 当前 CLI 现在支持 `train-codec`、`train-transition`、`evaluate`、`inspect-data`、`show-history`
+- transition 配置需要显式填写 `transition.codec_checkpoint`
+- 当前 exp3 YAML 已经清理为最小有效集：codec objective 和随机初始化相关字段不再保留在 exp3 配置里
+
+transition valid 阶段当前除了 loss 外，还会额外计算三类 answer 指标：
+
+- `teacher_forced_answer_acc`
+  - 给出完整 gold steps，只检查最后一个 answer 位置的 predicted latent 能不能 decode 出正确 answer
+- `rollout_direct_answer_acc`
+  - 只给 question，让 transition 自己 rollout
+  - 每一步直接把上一时刻 transition 预测出的 latent 继续送回 transition
+- `rollout_reencode_answer_acc`
+  - 只给 question，让 transition 自己 rollout
+  - 每一步先 decode 成文本 step，再把 `question + generated steps` 重新交给 codec encoder 编成 latent，再送回 transition
+
+同时还会记录：
+
+- `rollout_direct_answer_stop_rate`
+- `rollout_reencode_answer_stop_rate`
+
+它们表示 rollout 过程中，模型有多少比例真的把 `next_type` 切换成了 `answer`，而不是一直停留在 `step`。

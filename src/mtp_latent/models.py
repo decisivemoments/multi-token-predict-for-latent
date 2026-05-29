@@ -8,7 +8,7 @@ from torch import nn
 from transformers import GPT2Config as HFGPT2Config
 from transformers import GPT2LMHeadModel, GPT2Model
 
-from mtp_latent.config import ModelConfig
+from mtp_latent.config import ModelConfig, TransitionConfig
 
 
 class ReasoningCodec(nn.Module):
@@ -59,6 +59,7 @@ class ReasoningCodec(nn.Module):
         return self.decode_multi_horizon(latent, target_tokens, [1])[1]
 
     def _decode_hidden_states(self, latent: torch.Tensor, token_inputs: torch.Tensor) -> torch.Tensor:
+        latent = latent.to(self.decoder_latent_proj.weight.dtype)
         token_embeddings = self.decoder.transformer.wte(token_inputs)
         latent_prefix = self.decoder_latent_proj(latent).unsqueeze(1)
         inputs_embeds = torch.cat([latent_prefix, token_embeddings], dim=1)
@@ -130,3 +131,68 @@ class LatentTransitionModel(nn.Module):
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         return self.network(latent)
+
+
+class ReasoningTransitionModel(nn.Module):
+    def __init__(self, model_config: ModelConfig, transition_config: TransitionConfig, vocab_size: int) -> None:
+        super().__init__()
+        if model_config.model_name_or_path:
+            self.backbone = GPT2Model.from_pretrained(model_config.model_name_or_path)
+            transition_hidden_dim = self.backbone.config.n_embd
+        else:
+            if transition_config.hidden_dim % transition_config.n_head != 0:
+                raise ValueError("transition.hidden_dim must be divisible by transition.n_head")
+
+            backbone_config = HFGPT2Config(
+                vocab_size=vocab_size,
+                n_positions=model_config.n_positions,
+                n_ctx=model_config.n_positions,
+                n_embd=transition_config.hidden_dim,
+                n_layer=transition_config.num_layers,
+                n_head=transition_config.n_head,
+                resid_pdrop=transition_config.dropout,
+                embd_pdrop=transition_config.dropout,
+                attn_pdrop=transition_config.dropout,
+            )
+            self.backbone = GPT2Model(backbone_config)
+            transition_hidden_dim = transition_config.hidden_dim
+
+        self.backbone.config.use_cache = False
+        self.latent_in_proj = nn.Linear(model_config.latent_dim, transition_hidden_dim)
+        self.latent_out_proj = nn.Linear(transition_hidden_dim, model_config.latent_dim)
+        self.next_type_head = nn.Linear(transition_hidden_dim, 2)
+
+    def forward(
+        self,
+        question_ids: torch.Tensor,
+        question_mask: torch.Tensor,
+        latent_inputs: torch.Tensor,
+        latent_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        question_embeddings = self.backbone.wte(question_ids)
+        latent_embeddings = self.latent_in_proj(latent_inputs)
+        inputs_embeds = torch.cat([question_embeddings, latent_embeddings], dim=1)
+        attention_mask = torch.cat([question_mask.long(), latent_mask.long()], dim=1)
+        hidden_states = self.backbone(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
+
+        batch_size, max_latents = latent_mask.size()
+        question_lengths = question_mask.long().sum(dim=1)
+        device = hidden_states.device
+        supervision_indices = torch.zeros((batch_size, max_latents + 1), dtype=torch.long, device=device)
+        supervision_indices[:, 0] = torch.clamp(question_lengths - 1, min=0)
+        if max_latents > 0:
+            latent_offsets = torch.arange(max_latents, device=device).unsqueeze(0).expand(batch_size, -1)
+            supervision_indices[:, 1:] = question_lengths.unsqueeze(1) + latent_offsets
+
+        gather_index = supervision_indices.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+        supervision_hidden_states = hidden_states.gather(1, gather_index)
+        next_type_logits = self.next_type_head(supervision_hidden_states)
+        predicted_latents = self.latent_out_proj(supervision_hidden_states)
+        supervision_mask = torch.cat(
+            [
+                torch.ones((batch_size, 1), dtype=torch.bool, device=device),
+                latent_mask,
+            ],
+            dim=1,
+        )
+        return next_type_logits, predicted_latents, supervision_mask

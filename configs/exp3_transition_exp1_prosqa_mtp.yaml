@@ -1,4 +1,4 @@
-experiment_name: exp2a_prosqa_mtp_init
+experiment_name: exp3_transition_exp1_prosqa_mtp
 data:
   train_path: dataset/prosqa_train.json
   valid_path: dataset/prosqa_valid.json
@@ -21,14 +21,13 @@ model:
   n_layer: 4
   n_head: 4
   n_positions: 512
-  max_token_mtp_horizon: 3
+  max_token_mtp_horizon: 1
   dropout: 0.1
   init_source: mtp
-codec_objective:
-  name: decoder_token_mtp
-  horizon_weights: [1.0]
-  token_prediction_horizons: [1, 2, 3]
-  token_prediction_weights: [1.0, 0.5, 0.25]
+transition:
+  codec_checkpoint: outputs/exp1_prosqa_mtp_init/codec_best.pt
+  type_loss_weight: 1.0
+  decode_loss_weight: 1.0
 train:
   epochs: 5
   learning_rate: 0.0003
@@ -38,7 +37,8 @@ train:
   device: cuda
   precision: bf16
   allow_tf32: true
-  output_dir: outputs/exp2a_prosqa_mtp_init
-  tensorboard_dir: outputs/exp2a_prosqa_mtp_init/tensorboard
+  output_dir: outputs/exp3_transition_exp1_prosqa_mtp
+  tensorboard_dir: outputs/exp3_transition_exp1_prosqa_mtp/tensorboard
   log_every: 20
+  valid_generate_examples: 8
   distributed_backend: nccl

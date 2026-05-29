@@ -58,9 +58,13 @@ class CodecObjectiveConfig:
 class TransitionConfig:
     hidden_dim: int = 256
     num_layers: int = 2
+    n_head: int = 4
     dropout: float = 0.1
     init_source: str = "random"
+    codec_checkpoint: str | None = None
     init_checkpoint: str | None = None
+    type_loss_weight: float = 1.0
+    decode_loss_weight: float = 1.0
 
 
 @dataclass
@@ -129,5 +133,6 @@ class ExperimentConfig:
             "data": self.data.__dict__,
             "model": self.model.__dict__,
             "codec_objective": self.codec_objective.__dict__,
+            "transition": self.transition.__dict__,
             "train": self.train.__dict__,
         }

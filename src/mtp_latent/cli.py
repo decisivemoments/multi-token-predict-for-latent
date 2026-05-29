@@ -7,10 +7,10 @@ from pathlib import Path
 import torch
 
 from mtp_latent.config import ExperimentConfig
-from mtp_latent.data import build_dataloaders
-from mtp_latent.models import ReasoningCodec
-from mtp_latent.training import evaluate_codec, train_codec
-from mtp_latent.utils import cleanup_distributed, init_distributed, load_json, save_json, set_seed
+from mtp_latent.data import build_dataloaders, build_transition_dataloaders
+from mtp_latent.models import ReasoningCodec, ReasoningTransitionModel
+from mtp_latent.training import evaluate_codec, train_codec, train_transition
+from mtp_latent.utils import build_tokenizer, cleanup_distributed, init_distributed, load_json, save_json, set_seed
 
 
 def _load_codec_for_eval(codec: ReasoningCodec, checkpoint_path: str) -> None:
@@ -28,6 +28,42 @@ def run_train_codec(config_path: str) -> None:
     codec = ReasoningCodec(config.model, pad_token_id=tokenizer.pad_token_id)
     best_path = train_codec(codec, loaders, config)
     print(best_path)
+
+
+def run_train_transition(config_path: str) -> None:
+    config = ExperimentConfig.from_yaml(config_path)
+    if not config.transition.codec_checkpoint:
+        raise ValueError("transition.codec_checkpoint must be set for transition training.")
+    if not config.model.model_name_or_path:
+        raise ValueError("transition training requires model.model_name_or_path to initialize the GPT-2 transition backbone.")
+    set_seed(config.train.seed)
+    world_size = int(__import__("os").environ.get("WORLD_SIZE", "1"))
+    rank = int(__import__("os").environ.get("RANK", "0"))
+
+    dist_ctx = init_distributed(config.train.device, config.train.distributed_backend)
+    try:
+        codec_tokenizer_name = config.model.tokenizer_name_or_path or config.model.model_name_or_path
+        tokenizer = build_tokenizer(codec_tokenizer_name)
+        config.model.vocab_size = len(tokenizer)
+        codec = ReasoningCodec(config.model, pad_token_id=tokenizer.pad_token_id)
+        _load_codec_for_eval(codec, config.transition.codec_checkpoint)
+        codec.to(dist_ctx.device)
+        codec.eval()
+        _, transition_loaders, transition_tokenizer = build_transition_dataloaders(
+            config.data,
+            codec_tokenizer_name,
+            world_size=world_size,
+            rank=rank,
+        )
+        config.model.vocab_size = len(transition_tokenizer)
+        transition_model = ReasoningTransitionModel(config.model, config.transition, vocab_size=len(transition_tokenizer))
+        if config.transition.init_checkpoint:
+            state = torch.load(config.transition.init_checkpoint, map_location="cpu")
+            transition_model.load_state_dict(state["model_state"])
+        best_path = train_transition(transition_model, codec, transition_loaders, config)
+        print(best_path)
+    finally:
+        cleanup_distributed()
 
 
 def run_evaluate(config_path: str, codec_checkpoint: str) -> None:
@@ -74,6 +110,7 @@ def run_inspect_data(config_path: str) -> None:
         "tokenizer_vocab_size": len(tokenizer),
         "first_prefix": sample.prefix_text,
         "first_future_steps": sample.future_steps,
+        "first_future_kinds": sample.future_kinds,
         "first_answer": sample.answer,
         "train_batches": len(loaders["train"]),
         "valid_batches": len(loaders["valid"]),
@@ -89,6 +126,9 @@ def main() -> None:
     codec_parser = subparsers.add_parser("train-codec")
     codec_parser.add_argument("--config", required=True)
 
+    transition_parser = subparsers.add_parser("train-transition")
+    transition_parser.add_argument("--config", required=True)
+
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--config", required=True)
     evaluate_parser.add_argument("--codec-checkpoint", required=True)
@@ -103,6 +143,8 @@ def main() -> None:
 
     if args.command == "train-codec":
         run_train_codec(args.config)
+    elif args.command == "train-transition":
+        run_train_transition(args.config)
     elif args.command == "evaluate":
         run_evaluate(args.config, args.codec_checkpoint)
     elif args.command == "show-history":
