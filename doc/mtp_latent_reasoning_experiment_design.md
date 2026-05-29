@@ -407,6 +407,16 @@ transition 层面：
 
 ---
 
+## 6-5 transition model的实现
+![alt text](./pic/image-1.png)
+
+![alt text](./pic/image-2.png)
+
+目前transition model可以完成学习，并且有一定效果。
+
+接下来要做ntp和mtp的对比，并做结果分析
+
+
 ## 7. 实验三：训练完成后的 codec latent space 是否更适合 transition
 
 ### 7.1 假设
