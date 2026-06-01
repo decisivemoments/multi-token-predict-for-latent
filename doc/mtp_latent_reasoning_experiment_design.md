@@ -324,6 +324,27 @@ latent reasoning 层面：
 
 > 可能是强化了公式格式、数字模板等 shared surface-form directions，而不是精确 reasoning state。
 
+#### 实际实验
+1. codec mtp vs codec ntp. transition model : ntp
+在loss上更低，同时rollout得到的acc也更高
+![alt text](./pic/codec_mtp_ntp.png)
+
+![alt text](./pic/codec_mtp_ntp_da.png)
+![alt text](./pic/codec_mtp_ntp_ra.png)
+
+
+2. transition mtp vs ntp. codec: ntp
+mtp transition model loss更低，direct rollout得到的acc更高，但是reencode得到的acc更低
+![alt text](./pic/trans_mtp_ntp_loss.png)
+![alt text](./pic/trans_mtp_ntp_da.png)
+![alt text](./pic/trans_mtp_ntp_ra.png)
+
+
+
+
+结论：
+mtp作为表征生成的模型时效果比ntp好，在作为转换模型的初始化时表现略差
+
 ---
 
 ### 6.3 实验二 B：step-level MTP objective
