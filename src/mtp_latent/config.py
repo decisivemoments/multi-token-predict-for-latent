@@ -52,6 +52,7 @@ class CodecObjectiveConfig:
     token_prediction_horizons: list[int] = field(default_factory=lambda: [1])
     token_prediction_weights: list[float] = field(default_factory=lambda: [1.0])
     teacher_forcing: bool = True
+    answer_loss_weight: float = 1.0
 
 
 @dataclass

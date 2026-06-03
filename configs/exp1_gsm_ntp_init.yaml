@@ -19,6 +19,7 @@ model:
 codec_objective:
   name: standard
   horizon_weights: [1.0]
+  answer_loss_weight: 2.0
 train:
   epochs: 5
   learning_rate: 0.0003

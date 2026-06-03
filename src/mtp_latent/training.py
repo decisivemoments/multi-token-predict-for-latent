@@ -66,6 +66,29 @@ def _cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_inde
     )
 
 
+def _weighted_cross_entropy_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    sample_weights: torch.Tensor,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    token_loss = nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view_as(targets)
+    valid_mask = (targets != ignore_index).float()
+    token_counts = valid_mask.sum(dim=1)
+    safe_token_counts = token_counts.clamp_min(1.0)
+    sample_loss = (token_loss * valid_mask).sum(dim=1) / safe_token_counts
+    active_mask = token_counts > 0
+    if not active_mask.any():
+        return sample_loss.new_zeros(())
+    weighted_losses = sample_loss[active_mask] * sample_weights[active_mask]
+    return weighted_losses.sum() / sample_weights[active_mask].sum().clamp_min(1e-8)
+
+
 def _classification_accuracy(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> float:
     predictions = logits.argmax(dim=-1)
     mask = targets != ignore_index
@@ -90,6 +113,16 @@ def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip()).lower()
 
 
+def _answer_sample_weights(batch, horizon: int, device: torch.device, answer_loss_weight: float) -> torch.Tensor:
+    weights = torch.ones(len(batch["future_kinds"]), device=device)
+    if answer_loss_weight == 1.0:
+        return weights
+    for index, future_kinds in enumerate(batch["future_kinds"]):
+        if horizon < len(future_kinds) and future_kinds[horizon] == "answer":
+            weights[index] = answer_loss_weight
+    return weights
+
+
 def compute_codec_loss(
     codec: ReasoningCodec,
     batch: dict[str, torch.Tensor | list[str] | list[list[str]]],
@@ -112,6 +145,7 @@ def compute_codec_loss(
         for horizon, target_tokens in enumerate(batch["target_steps"]):
             target_tokens = target_tokens.to(device, non_blocking=True)
             target_labels = batch["target_labels"][horizon].to(device, non_blocking=True)
+            sample_weights = _answer_sample_weights(batch, horizon, device, objective_config.answer_loss_weight)
             if target_tokens.size(1) == 0:
                 continue
             active = horizon_mask[:, horizon].float().mean()
@@ -124,7 +158,7 @@ def compute_codec_loss(
             if objective_config.name == "standard":
                 logits = raw_codec.decode(latent, target_tokens)
                 targets = target_labels
-                sample_loss = _cross_entropy_loss(logits, targets)
+                sample_loss = _weighted_cross_entropy_loss(logits, targets, sample_weights)
                 weight = objective_config.horizon_weights[min(horizon, len(objective_config.horizon_weights) - 1)]
                 losses.append(weight * sample_loss * active)
                 metrics["token_h1_loss"] = sample_loss.detach().item()
@@ -154,7 +188,7 @@ def compute_codec_loss(
                     weight = objective_config.token_prediction_weights[
                         min(token_horizon - 1, len(objective_config.token_prediction_weights) - 1)
                     ]
-                    sample_loss = _cross_entropy_loss(logits, targets)
+                    sample_loss = _weighted_cross_entropy_loss(logits, targets, sample_weights)
                     losses.append(weight * sample_loss * active)
                     metrics[f"token_h{token_horizon}_loss"] = sample_loss.detach().item()
                     metrics[f"token_h{token_horizon}_acc"] = masked_token_accuracy(
@@ -183,6 +217,9 @@ def evaluate_codec(
     metric_sums: dict[str, float] = {}
     answer_correct = 0.0
     answer_total = 0.0
+    answer_token_loss_sum = 0.0
+    answer_token_acc_sum = 0.0
+    answer_batch_count = 0
     raw_codec = _unwrap_codec(codec)
     tokenizer = loader.dataset.tokenizer
     autocast_dtype = _autocast_dtype(config.train.precision) if device.type == "cuda" else None
@@ -203,13 +240,19 @@ def evaluate_codec(
             if answer_indices:
                 prefix_ids = batch["prefix_ids"][answer_indices].to(device, non_blocking=True)
                 prefix_mask = batch["prefix_mask"][answer_indices].to(device, non_blocking=True)
+                answer_target_tokens = batch["target_steps"][0][answer_indices].to(device, non_blocking=True)
+                answer_target_labels = batch["target_labels"][0][answer_indices].to(device, non_blocking=True)
                 with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
                     latent = raw_codec.encode(prefix_ids, prefix_mask)
+                    answer_logits = raw_codec.decode(latent, answer_target_tokens)
                     generated_token_ids, _ = raw_codec.generate_step(
                         latent,
                         eos_token_id=tokenizer.eos_token_id,
                         max_new_tokens=config.data.max_step_tokens,
                     )
+                answer_token_loss_sum += _cross_entropy_loss(answer_logits, answer_target_labels).item()
+                answer_token_acc_sum += masked_token_accuracy(answer_logits.detach(), answer_target_labels.detach())
+                answer_batch_count += 1
                 predictions = _decode_generated_tokens(tokenizer, generated_token_ids)
                 gold_answers = [batch["future_texts"][index][0] for index in answer_indices]
                 answer_correct += sum(
@@ -229,11 +272,23 @@ def evaluate_codec(
         dist.all_reduce(answer_tensor, op=dist.ReduceOp.SUM)
         answer_correct = answer_tensor[0].item()
         answer_total = answer_tensor[1].item()
+        answer_metric_tensor = torch.tensor(
+            [answer_token_loss_sum, answer_token_acc_sum, answer_batch_count],
+            device=device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(answer_metric_tensor, op=dist.ReduceOp.SUM)
+        answer_token_loss_sum = answer_metric_tensor[0].item()
+        answer_token_acc_sum = answer_metric_tensor[1].item()
+        answer_batch_count = int(answer_metric_tensor[2].item())
 
     averaged = {key: value / max(count, 1) for key, value in metric_sums.items()}
     if answer_total > 0:
         averaged["answer_acc"] = answer_correct / answer_total
         averaged["answer_count"] = answer_total
+    if answer_batch_count > 0:
+        averaged["answer_token_loss"] = answer_token_loss_sum / answer_batch_count
+        averaged["answer_token_acc"] = answer_token_acc_sum / answer_batch_count
     return EpochResult(loss=total_loss / max(count, 1), metrics=averaged)
 
 
@@ -353,6 +408,8 @@ def _build_compact_valid_entry(
         "primary_loss",
         "token_h1_loss",
         "token_h1_acc",
+        "answer_token_loss",
+        "answer_token_acc",
         "answer_acc",
         "type_loss",
         "decode_loss",

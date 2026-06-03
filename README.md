@@ -114,6 +114,12 @@ outputs/<experiment_name>/valid_generations/epoch_001.json
 ```
 
 里面会保存 `prefix_text`、`target_kind`、`target_text`、`predicted_text`、`finished_with_eos` 和 `answer_correct`。同时，`valid_metrics` 里会额外包含 `answer_acc`，方便直接看 answer 样本上的生成准确率。
+现在还会额外包含：
+
+- `answer_token_loss`
+- `answer_token_acc`
+
+用于区分“answer token 本身有没有学会”和“自由生成 exact match 为什么仍然偏低”。
 
 另外还会保存一个紧凑版 valid 摘要：
 
