@@ -115,6 +115,14 @@ outputs/<experiment_name>/valid_generations/epoch_001.json
 
 里面会保存 `prefix_text`、`target_kind`、`target_text`、`predicted_text`、`finished_with_eos` 和 `answer_correct`。同时，`valid_metrics` 里会额外包含 `answer_acc`，方便直接看 answer 样本上的生成准确率。
 
+另外还会保存一个紧凑版 valid 摘要：
+
+```bash
+outputs/<experiment_name>/codec_valid_compact.json
+```
+
+这个文件每个 epoch 只保留少量关键字段，方便直接复制文本做外部分析。
+
 transition 训练完成后，也会额外写：
 
 ```bash
@@ -136,6 +144,14 @@ transition valid 现在还会额外记录三类 answer 指标：
 - `rollout_reencode_answer_acc`
 
 以及对应的 `*_answer_stop_rate`，用来衡量 rollout 时模型有没有真的切换到 `answer`。
+
+transition 也会保存紧凑版 valid 摘要：
+
+```bash
+outputs/<experiment_name>/transition_valid_compact.json
+```
+
+这个文件同样只保留关键指标，适合直接复制给 Codex 或其他模型分析。
 
 transition 训练的初始化口径现在是固定的：
 

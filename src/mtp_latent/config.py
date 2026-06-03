@@ -33,9 +33,9 @@ class ModelConfig:
     tokenizer_name_or_path: str = "gpt2"
     model_name_or_path: str | None = None
     vocab_size: int = 50257
-    embedding_dim: int = 256
-    hidden_dim: int = 256
-    latent_dim: int = 256
+    embedding_dim: int = 768
+    hidden_dim: int = 768
+    latent_dim: int = 768
     n_layer: int = 4
     n_head: int = 4
     n_positions: int = 512
@@ -56,7 +56,7 @@ class CodecObjectiveConfig:
 
 @dataclass
 class TransitionConfig:
-    hidden_dim: int = 256
+    hidden_dim: int = 768
     num_layers: int = 2
     n_head: int = 4
     dropout: float = 0.1
@@ -82,6 +82,9 @@ class TrainConfig:
     tensorboard_dir: str | None = None
     valid_generate_examples: int = 8
     distributed_backend: str = "nccl"
+    scheduler: str = "cosine"
+    warmup_ratio: float = 0.03
+    min_lr_ratio: float = 0.1
 
 
 @dataclass

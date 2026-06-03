@@ -14,15 +14,7 @@ model:
   backbone_type: gpt2
   tokenizer_name_or_path: /inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model/gpt2-self-mtp
   model_name_or_path: /inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model/gpt2-self-mtp
-  vocab_size: 50257
-  embedding_dim: 256
-  hidden_dim: 256
-  latent_dim: 256
-  n_layer: 4
-  n_head: 4
-  n_positions: 512
-  max_token_mtp_horizon: 1
-  dropout: 0.1
+  latent_dim: 768
   init_source: mtp
 transition:
   codec_checkpoint: outputs/exp1_prosqa_mtp_init/codec_best.pt

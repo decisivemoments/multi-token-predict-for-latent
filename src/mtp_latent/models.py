@@ -11,6 +11,15 @@ from transformers import GPT2LMHeadModel, GPT2Model
 from mtp_latent.config import ModelConfig, TransitionConfig
 
 
+def _maybe_identity_init(linear: nn.Linear) -> None:
+    if linear.in_features != linear.out_features:
+        return
+    with torch.no_grad():
+        nn.init.eye_(linear.weight)
+        if linear.bias is not None:
+            nn.init.zeros_(linear.bias)
+
+
 class ReasoningCodec(nn.Module):
     def __init__(self, model_config: ModelConfig, pad_token_id: int) -> None:
         super().__init__()
@@ -41,6 +50,8 @@ class ReasoningCodec(nn.Module):
         self.decoder.transformer.config.use_cache = False
         self.latent_proj = nn.Linear(hidden_size, model_config.latent_dim)
         self.decoder_latent_proj = nn.Linear(model_config.latent_dim, self.decoder.config.n_embd)
+        _maybe_identity_init(self.latent_proj)
+        _maybe_identity_init(self.decoder_latent_proj)
         self.future_token_heads = nn.ModuleDict(
             {
                 str(horizon): nn.Linear(self.decoder.config.n_embd, self.decoder.config.vocab_size, bias=False)

@@ -4,11 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import re
+import math
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -312,6 +314,60 @@ def _save_model_state(model, config: ExperimentConfig, valid_metrics: dict[str, 
     if dist_ctx.is_main_process:
         raw_model = model.module if isinstance(model, DDP) else model
         torch.save({"model_state": raw_model.state_dict(), "config": config.dump_dict(), "valid_metrics": valid_metrics}, path)
+
+
+def _build_scheduler(optimizer: torch.optim.Optimizer, config: ExperimentConfig, total_steps: int) -> LambdaLR | None:
+    if total_steps <= 0 or config.train.scheduler == "none":
+        return None
+    if config.train.scheduler != "cosine":
+        raise ValueError(f"Unsupported train.scheduler={config.train.scheduler}")
+
+    warmup_steps = int(total_steps * config.train.warmup_ratio)
+    min_lr_ratio = config.train.min_lr_ratio
+
+    def lr_lambda(current_step: int) -> float:
+        if warmup_steps > 0 and current_step < warmup_steps:
+            return float(current_step + 1) / float(max(warmup_steps, 1))
+        if total_steps <= warmup_steps:
+            return 1.0
+        progress = float(current_step - warmup_steps) / float(max(total_steps - warmup_steps, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(progress * math.pi))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _build_compact_valid_entry(
+    epoch: int,
+    stage: str,
+    loss: float,
+    metrics: dict[str, float],
+) -> dict[str, float | int | str]:
+    entry: dict[str, float | int | str] = {
+        "epoch": epoch,
+        "stage": stage,
+        "loss": round(loss, 6),
+    }
+    preferred_keys = [
+        "primary_loss",
+        "token_h1_loss",
+        "token_h1_acc",
+        "answer_acc",
+        "type_loss",
+        "decode_loss",
+        "type_acc",
+        "decode_token_acc",
+        "teacher_forced_answer_acc",
+        "rollout_direct_answer_acc",
+        "rollout_direct_answer_stop_rate",
+        "rollout_reencode_answer_acc",
+        "rollout_reencode_answer_stop_rate",
+    ]
+    for key in preferred_keys:
+        if key in metrics:
+            entry[key] = round(float(metrics[key]), 6)
+    return entry
 
 
 def _flatten_active_transition_targets(
@@ -847,10 +903,13 @@ def train_codec(
         lr=config.train.learning_rate,
         weight_decay=config.train.weight_decay,
     )
+    total_steps = config.train.epochs * len(loaders["train"])
+    scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
     best_path = output_dir / "codec_best.pt"
     valid_generation_dir = ensure_dir(output_dir / "valid_generations")
     history: dict[str, list[dict[str, float]]] = {"train": [], "valid": []}
+    valid_summary: list[dict[str, float | int | str]] = []
     best_valid = float("inf")
     writer = _build_summary_writer(config, "codec", dist_ctx)
     global_step = 0
@@ -871,6 +930,8 @@ def train_codec(
                 loss.backward()
                 _clip_grad_norm(codec, config.train.grad_clip_norm)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 global_step += 1
                 steps_in_epoch += 1
@@ -878,6 +939,7 @@ def train_codec(
                 step_loss_value = distributed_mean(loss.item(), device) if dist_ctx.enabled else loss.item()
                 if writer is not None:
                     writer.add_scalar("train/step_loss", step_loss_value, global_step)
+                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 _write_metrics(writer, "train_step", metrics, global_step)
                 for key, value in metrics.items():
                     metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -915,6 +977,9 @@ def train_codec(
                         "samples": valid_generations,
                     },
                 )
+                valid_summary.append(
+                    _build_compact_valid_entry(epoch + 1, "codec", valid_result.loss, valid_result.metrics)
+                )
             if dist_ctx.enabled:
                 dist.barrier()
             if writer is not None:
@@ -929,6 +994,7 @@ def train_codec(
 
         if dist_ctx.is_main_process:
             save_json(output_dir / "codec_history.json", history)
+            save_json(output_dir / "codec_valid_compact.json", valid_summary)
         return best_path
     finally:
         if writer is not None:
@@ -957,10 +1023,13 @@ def train_transition(
         lr=config.train.learning_rate,
         weight_decay=config.train.weight_decay,
     )
+    total_steps = config.train.epochs * len(loaders["train"])
+    scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
     best_path = output_dir / "transition_best.pt"
     valid_generation_dir = ensure_dir(output_dir / "transition_valid_generations")
     history: dict[str, list[dict[str, float]]] = {"train": [], "valid": []}
+    valid_summary: list[dict[str, float | int | str]] = []
     best_valid = float("inf")
     writer = _build_summary_writer(config, "transition", dist_ctx)
     global_step = 0
@@ -981,6 +1050,8 @@ def train_transition(
                 loss.backward()
                 _clip_grad_norm(transition_model, config.train.grad_clip_norm)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
                 global_step += 1
                 steps_in_epoch += 1
@@ -988,6 +1059,7 @@ def train_transition(
                 step_loss_value = distributed_mean(loss.item(), device) if dist_ctx.enabled else loss.item()
                 if writer is not None:
                     writer.add_scalar("train/step_loss", step_loss_value, global_step)
+                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
                 _write_metrics(writer, "train_step", metrics, global_step)
                 for key, value in metrics.items():
                     metric_sums[key] = metric_sums.get(key, 0.0) + value
@@ -1035,6 +1107,9 @@ def train_transition(
                         "rollout_samples": rollout_samples,
                     },
                 )
+                valid_summary.append(
+                    _build_compact_valid_entry(epoch + 1, "transition", valid_result.loss, valid_result.metrics)
+                )
             if dist_ctx.enabled:
                 dist.barrier()
             if writer is not None:
@@ -1049,6 +1124,7 @@ def train_transition(
 
         if dist_ctx.is_main_process:
             save_json(output_dir / "transition_history.json", history)
+            save_json(output_dir / "transition_valid_compact.json", valid_summary)
         return best_path
     finally:
         if writer is not None:
