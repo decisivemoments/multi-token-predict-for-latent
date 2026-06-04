@@ -62,6 +62,7 @@ pip install -r requirements.txt
 - `train.device`: 支持 `auto`、`cuda`、`cuda:0`、`cpu`
 - `torchrun + DDP`: 支持多卡并行；单卡命令语义保持不变
 - `train-transition`: 支持基于冻结 codec 的 transition 训练
+- `train-sft`: 支持 ProsQA/GSM 风格的普通 SFT sanity check
 
 在服务器上先把对应 YAML 里的 `model.tokenizer_name_or_path` 和 `model.model_name_or_path` 改成实际模型路径。transition 训练同时还要求 `transition.codec_checkpoint` 指向实验一或实验二A输出的 `codec_best.pt`。
 
@@ -164,6 +165,23 @@ transition 训练的初始化口径现在是固定的：
 - frozen codec 总是从 `transition.codec_checkpoint` 加载
 - transition backbone 总是从 `model.model_name_or_path` 加载预训练 GPT-2
 - `transition.init_checkpoint` 只用于恢复一个已经训练中的 transition checkpoint
+
+另外还补了三种 SFT baseline，用来判断任务本身对当前 GPT-2 是否已经过难：
+
+- `next_step`: `question + previous_steps -> current_step`
+- `answer_from_steps`: `question + all_steps -> answer`
+- `answer_from_question`: `question -> answer`
+
+当前先提供了 ProsQA 的 6 组现成配置和脚本：
+
+```bash
+configs/sft_prosqa_next_step_ntp.yaml
+configs/sft_prosqa_next_step_mtp.yaml
+configs/sft_prosqa_answer_from_steps_ntp.yaml
+configs/sft_prosqa_answer_from_steps_mtp.yaml
+configs/sft_prosqa_answer_from_question_ntp.yaml
+configs/sft_prosqa_answer_from_question_mtp.yaml
+```
 
 ## 初始化与扩展
 

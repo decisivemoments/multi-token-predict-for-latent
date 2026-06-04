@@ -133,6 +133,30 @@ valid 阶段单独统计：
    - numeric answer match
    - value-only correctness
 
+## 新增 sanity check：SFT 基线
+
+为了判断 ProsQA 这个任务是不是连普通 SFT 都难以学会，当前补充三种 SFT 基线：
+
+1. `next_step_sft`
+   - 输入：`question + previous_steps`
+   - 输出：`current_step`
+   - 作用：检查不用 latent 压缩时，模型能否直接学会下一步推理生成
+
+2. `answer_from_steps_sft`
+   - 输入：`question + all_steps`
+   - 输出：`answer`
+   - 作用：检查如果把完整推理轨迹都给模型，它能否稳定生成最终答案
+
+3. `answer_from_question_sft`
+   - 输入：`question`
+   - 输出：`answer`
+   - 作用：检查不显式提供中间步骤时，模型在最终问答上的直接上限
+
+这三组 baseline 的意义是：
+
+- 如果普通 SFT 都学不会，那么当前 latent codec 方案更难，结果偏低就不奇怪
+- 如果普通 SFT 能学会，而 latent codec 学不会，就说明主要瓶颈在 latent 接口和条件化方式
+
 ## 下一轮方向
 
 如果第一轮后 codec 明显改善，但 transition 仍然弱，下一轮最自然的结构改动是：

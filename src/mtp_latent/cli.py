@@ -7,9 +7,9 @@ from pathlib import Path
 import torch
 
 from mtp_latent.config import ExperimentConfig
-from mtp_latent.data import build_dataloaders, build_transition_dataloaders
-from mtp_latent.models import ReasoningCodec, ReasoningTransitionModel
-from mtp_latent.training import evaluate_codec, train_codec, train_transition
+from mtp_latent.data import build_dataloaders, build_sft_dataloaders, build_transition_dataloaders
+from mtp_latent.models import ReasoningCodec, ReasoningTransitionModel, SFTLanguageModel
+from mtp_latent.training import evaluate_codec, train_codec, train_sft, train_transition
 from mtp_latent.utils import build_tokenizer, cleanup_distributed, init_distributed, load_json, save_json, set_seed
 
 
@@ -64,6 +64,24 @@ def run_train_transition(config_path: str) -> None:
         print(best_path)
     finally:
         cleanup_distributed()
+
+
+def run_train_sft(config_path: str) -> None:
+    config = ExperimentConfig.from_yaml(config_path)
+    set_seed(config.train.seed)
+    world_size = int(__import__("os").environ.get("WORLD_SIZE", "1"))
+    rank = int(__import__("os").environ.get("RANK", "0"))
+    _, loaders, tokenizer = build_sft_dataloaders(
+        config.data,
+        config.model.tokenizer_name_or_path,
+        config.sft.task,
+        world_size=world_size,
+        rank=rank,
+    )
+    config.model.vocab_size = len(tokenizer)
+    model = SFTLanguageModel(config.model)
+    best_path = train_sft(model, loaders, config)
+    print(best_path)
 
 
 def run_evaluate(config_path: str, codec_checkpoint: str) -> None:
@@ -129,6 +147,9 @@ def main() -> None:
     transition_parser = subparsers.add_parser("train-transition")
     transition_parser.add_argument("--config", required=True)
 
+    sft_parser = subparsers.add_parser("train-sft")
+    sft_parser.add_argument("--config", required=True)
+
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument("--config", required=True)
     evaluate_parser.add_argument("--codec-checkpoint", required=True)
@@ -145,6 +166,8 @@ def main() -> None:
         run_train_codec(args.config)
     elif args.command == "train-transition":
         run_train_transition(args.config)
+    elif args.command == "train-sft":
+        run_train_sft(args.config)
     elif args.command == "evaluate":
         run_evaluate(args.config, args.codec_checkpoint)
     elif args.command == "show-history":

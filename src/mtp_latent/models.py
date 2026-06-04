@@ -11,6 +11,18 @@ from transformers import GPT2LMHeadModel, GPT2Model
 from mtp_latent.config import ModelConfig, TransitionConfig
 
 
+def _from_pretrained(model_cls, model_config: ModelConfig):
+    kwargs = {}
+    if model_config.attn_implementation:
+        kwargs["attn_implementation"] = model_config.attn_implementation
+    try:
+        return model_cls.from_pretrained(model_config.model_name_or_path, **kwargs)
+    except (TypeError, ValueError) as error:
+        if "attn" not in str(error).lower():
+            raise
+    return model_cls.from_pretrained(model_config.model_name_or_path)
+
+
 def _maybe_identity_init(linear: nn.Linear) -> None:
     if linear.in_features != linear.out_features:
         return
@@ -27,8 +39,8 @@ class ReasoningCodec(nn.Module):
         self.pad_token_id = pad_token_id
 
         if model_config.model_name_or_path:
-            self.encoder = GPT2Model.from_pretrained(model_config.model_name_or_path)
-            self.decoder = GPT2LMHeadModel.from_pretrained(model_config.model_name_or_path)
+            self.encoder = _from_pretrained(GPT2Model, model_config)
+            self.decoder = _from_pretrained(GPT2LMHeadModel, model_config)
         else:
             gpt2_config = HFGPT2Config(
                 vocab_size=model_config.vocab_size,
@@ -40,6 +52,7 @@ class ReasoningCodec(nn.Module):
                 resid_pdrop=model_config.dropout,
                 embd_pdrop=model_config.dropout,
                 attn_pdrop=model_config.dropout,
+                attn_implementation=model_config.attn_implementation,
             )
             self.encoder = GPT2Model(gpt2_config)
             self.decoder = GPT2LMHeadModel(gpt2_config)
@@ -127,6 +140,66 @@ class ReasoningCodec(nn.Module):
         return generated, finished
 
 
+class SFTLanguageModel(nn.Module):
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__()
+        if model_config.model_name_or_path:
+            self.model = _from_pretrained(GPT2LMHeadModel, model_config)
+        else:
+            gpt2_config = HFGPT2Config(
+                vocab_size=model_config.vocab_size,
+                n_positions=model_config.n_positions,
+                n_ctx=model_config.n_positions,
+                n_embd=model_config.embedding_dim,
+                n_layer=model_config.n_layer,
+                n_head=model_config.n_head,
+                resid_pdrop=model_config.dropout,
+                embd_pdrop=model_config.dropout,
+                attn_pdrop=model_config.dropout,
+                attn_implementation=model_config.attn_implementation,
+            )
+            self.model = GPT2LMHeadModel(gpt2_config)
+        self.model.config.use_cache = False
+        self.model.transformer.config.use_cache = False
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model(input_ids=input_ids, attention_mask=attention_mask.long()).logits
+
+    def generate_continuation(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        eos_token_id: int,
+        max_new_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        generated = input_ids
+        generated_mask = attention_mask.long()
+        finished = torch.zeros(input_ids.size(0), dtype=torch.bool, device=input_ids.device)
+        new_tokens: list[torch.Tensor] = []
+
+        for _ in range(max_new_tokens):
+            logits = self.model(input_ids=generated, attention_mask=generated_mask).logits[:, -1, :]
+            next_token = logits.argmax(dim=-1)
+            next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
+            new_tokens.append(next_token)
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+            generated_mask = torch.cat(
+                [generated_mask, torch.ones((generated_mask.size(0), 1), device=generated_mask.device, dtype=generated_mask.dtype)],
+                dim=1,
+            )
+            finished = finished | (next_token == eos_token_id)
+            if finished.all():
+                break
+
+        if new_tokens:
+            return torch.stack(new_tokens, dim=1), finished
+        return torch.empty((input_ids.size(0), 0), dtype=torch.long, device=input_ids.device), finished
+
+
 class LatentTransitionModel(nn.Module):
     def __init__(self, latent_dim: int, hidden_dim: int, num_layers: int, dropout: float) -> None:
         super().__init__()
@@ -148,7 +221,7 @@ class ReasoningTransitionModel(nn.Module):
     def __init__(self, model_config: ModelConfig, transition_config: TransitionConfig, vocab_size: int) -> None:
         super().__init__()
         if model_config.model_name_or_path:
-            self.backbone = GPT2Model.from_pretrained(model_config.model_name_or_path)
+            self.backbone = _from_pretrained(GPT2Model, model_config)
             transition_hidden_dim = self.backbone.config.n_embd
         else:
             if transition_config.hidden_dim % transition_config.n_head != 0:
@@ -164,6 +237,7 @@ class ReasoningTransitionModel(nn.Module):
                 resid_pdrop=transition_config.dropout,
                 embd_pdrop=transition_config.dropout,
                 attn_pdrop=transition_config.dropout,
+                attn_implementation=model_config.attn_implementation,
             )
             self.backbone = GPT2Model(backbone_config)
             transition_hidden_dim = transition_config.hidden_dim

@@ -37,6 +37,13 @@ class TransitionSample:
     answer: str
 
 
+@dataclass
+class SFTSample:
+    prompt_text: str
+    target_text: str
+    target_kind: str
+
+
 def load_reasoning_traces(
     path: str | Path,
     max_records: int | None = None,
@@ -347,6 +354,132 @@ class TransitionDataset(Dataset):
         }
 
 
+def build_sft_samples(
+    records: Iterable[TraceRecord],
+    data_config: DataConfig,
+    task: str,
+) -> list[SFTSample]:
+    samples: list[SFTSample] = []
+    for record in records:
+        if task == "next_step":
+            for index, step_text in enumerate(record.steps):
+                prefix_steps = record.steps[:index]
+                prefix_parts = [record.question]
+                if prefix_steps:
+                    prefix_parts.append(data_config.text_separator.join(prefix_steps))
+                samples.append(
+                    SFTSample(
+                        prompt_text=data_config.text_separator.join(prefix_parts).strip(),
+                        target_text=step_text,
+                        target_kind="step",
+                    )
+                )
+            continue
+
+        if not record.answer:
+            continue
+
+        if task == "answer_from_steps":
+            prompt_parts = [record.question, data_config.text_separator.join(record.steps)]
+            samples.append(
+                SFTSample(
+                    prompt_text=data_config.text_separator.join(prompt_parts).strip(),
+                    target_text=record.answer,
+                    target_kind="answer",
+                )
+            )
+            continue
+
+        if task == "answer_from_question":
+            samples.append(
+                SFTSample(
+                    prompt_text=record.question,
+                    target_text=record.answer,
+                    target_kind="answer",
+                )
+            )
+            continue
+
+        raise ValueError(f"Unsupported sft.task={task}")
+    return samples
+
+
+class SFTDataset(Dataset):
+    def __init__(self, path: str | Path, data_config: DataConfig, tokenizer, split: str, task: str) -> None:
+        self.data_config = data_config
+        self.tokenizer = tokenizer
+        self.task = task
+        max_records = {
+            "train": data_config.train_max_records,
+            "valid": data_config.valid_max_records,
+            "test": data_config.test_max_records,
+        }[split]
+        self.records = load_reasoning_traces(
+            path,
+            max_records=max_records,
+            drop_empty_steps=data_config.drop_empty_steps,
+        )
+        self.samples = build_sft_samples(self.records, data_config, task)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> SFTSample:
+        return self.samples[index]
+
+    def collate_fn(self, batch: list[SFTSample]) -> dict[str, torch.Tensor | list[str]]:
+        prompt_texts = [sample.prompt_text for sample in batch]
+        target_texts = [sample.target_text for sample in batch]
+
+        prompt_tokens = self.tokenizer(
+            prompt_texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=True,
+            max_length=self.data_config.max_prefix_tokens,
+        )
+        target_tokens = self.tokenizer(
+            target_texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=True,
+            max_length=max(self.data_config.max_step_tokens - 1, 0),
+        )
+
+        input_sequences: list[torch.Tensor] = []
+        label_sequences: list[torch.Tensor] = []
+        max_length = 0
+
+        for prompt_ids, target_ids in zip(prompt_tokens["input_ids"], target_tokens["input_ids"]):
+            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long)
+            target_tensor = torch.tensor(target_ids + [self.tokenizer.eos_token_id], dtype=torch.long)
+            input_tensor = torch.cat([prompt_tensor, target_tensor], dim=0)
+            labels = torch.full((input_tensor.size(0),), -100, dtype=torch.long)
+            labels[prompt_tensor.size(0):] = target_tensor
+            input_sequences.append(input_tensor)
+            label_sequences.append(labels)
+            max_length = max(max_length, input_tensor.size(0))
+
+        input_ids = torch.full((len(batch), max_length), self.tokenizer.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(batch), max_length), dtype=torch.bool)
+        labels = torch.full((len(batch), max_length), -100, dtype=torch.long)
+
+        for row, (input_tensor, label_tensor) in enumerate(zip(input_sequences, label_sequences)):
+            seq_len = input_tensor.size(0)
+            input_ids[row, :seq_len] = input_tensor
+            attention_mask[row, :seq_len] = True
+            labels[row, :seq_len] = label_tensor
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "prompt_texts": prompt_texts,
+            "target_texts": target_texts,
+            "target_kinds": [sample.target_kind for sample in batch],
+        }
+
+
 def build_dataloaders(
     data_config: DataConfig,
     tokenizer_name_or_path: str,
@@ -469,3 +602,63 @@ def build_transition_dataloaders(
         ),
     }
     return split_datasets["train"], loaders, tokenizer
+
+
+def build_sft_dataloaders(
+    data_config: DataConfig,
+    tokenizer_name_or_path: str,
+    task: str,
+    world_size: int = 1,
+    rank: int = 0,
+) -> tuple[SFTDataset, dict[str, DataLoader], object]:
+    tokenizer = build_tokenizer(tokenizer_name_or_path)
+    train_dataset = SFTDataset(data_config.train_path, data_config, tokenizer=tokenizer, split="train", task=task)
+    valid_dataset = SFTDataset(data_config.valid_path, data_config, tokenizer=tokenizer, split="valid", task=task)
+    test_dataset = SFTDataset(data_config.test_path, data_config, tokenizer=tokenizer, split="test", task=task)
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    valid_sampler = DistributedSampler(valid_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+
+    persistent_workers = data_config.persistent_workers and data_config.num_workers > 0
+    loader_kwargs = {
+        "num_workers": data_config.num_workers,
+        "collate_fn": train_dataset.collate_fn,
+        "pin_memory": data_config.pin_memory,
+        "persistent_workers": persistent_workers,
+    }
+    if data_config.num_workers > 0 and data_config.prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = data_config.prefetch_factor
+
+    loaders = {
+        "train": DataLoader(
+            train_dataset,
+            batch_size=data_config.batch_size,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
+            **loader_kwargs,
+        ),
+        "valid": DataLoader(
+            valid_dataset,
+            batch_size=data_config.batch_size,
+            shuffle=False,
+            sampler=valid_sampler,
+            num_workers=data_config.num_workers,
+            collate_fn=valid_dataset.collate_fn,
+            pin_memory=data_config.pin_memory,
+            persistent_workers=persistent_workers,
+            **({"prefetch_factor": data_config.prefetch_factor} if data_config.num_workers > 0 and data_config.prefetch_factor is not None else {}),
+        ),
+        "test": DataLoader(
+            test_dataset,
+            batch_size=data_config.batch_size,
+            shuffle=False,
+            sampler=test_sampler,
+            num_workers=data_config.num_workers,
+            collate_fn=test_dataset.collate_fn,
+            pin_memory=data_config.pin_memory,
+            persistent_workers=persistent_workers,
+            **({"prefetch_factor": data_config.prefetch_factor} if data_config.num_workers > 0 and data_config.prefetch_factor is not None else {}),
+        ),
+    }
+    return train_dataset, loaders, tokenizer

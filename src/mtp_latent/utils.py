@@ -59,6 +59,8 @@ def configure_torch_runtime(device: torch.device, allow_tf32: bool) -> None:
     torch.backends.cuda.matmul.allow_tf32 = allow_tf32
     torch.backends.cudnn.allow_tf32 = allow_tf32
     torch.backends.cudnn.benchmark = True
+    if allow_tf32:
+        torch.set_float32_matmul_precision("high")
 
 
 class DistributedContext:

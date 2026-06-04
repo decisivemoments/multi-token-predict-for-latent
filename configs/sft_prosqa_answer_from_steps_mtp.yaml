@@ -1,0 +1,29 @@
+experiment_name: sft_prosqa_answer_from_steps_mtp
+data:
+  train_path: dataset/prosqa_train.json
+  valid_path: dataset/prosqa_valid.json
+  test_path: dataset/prosqa_test.json
+  max_prefix_tokens: 384
+  max_step_tokens: 64
+  max_horizon: 1
+  batch_size: 16
+  num_workers: 8
+  text_separator: "\n"
+  drop_empty_steps: true
+model:
+  tokenizer_name_or_path: /inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model/gpt2-self-mtp
+  model_name_or_path: /inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model/gpt2-self-mtp
+sft:
+  task: answer_from_steps
+train:
+  epochs: 25
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  seed: 42
+  device: cuda
+  precision: bf16
+  allow_tf32: true
+  output_dir: outputs/sft_prosqa_answer_from_steps_mtp
+  tensorboard_dir: outputs/sft_prosqa_answer_from_steps_mtp/tensorboard
+  log_every: 20

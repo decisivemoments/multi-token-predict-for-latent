@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from mtp_latent.config import CodecObjectiveConfig, ExperimentConfig
 from mtp_latent.metrics import cosine_retrieval_metrics, masked_token_accuracy
-from mtp_latent.models import ReasoningCodec, ReasoningTransitionModel
+from mtp_latent.models import ReasoningCodec, ReasoningTransitionModel, SFTLanguageModel
 from mtp_latent.utils import (
     DistributedContext,
     cleanup_distributed,
@@ -82,11 +82,9 @@ def _weighted_cross_entropy_loss(
     token_counts = valid_mask.sum(dim=1)
     safe_token_counts = token_counts.clamp_min(1.0)
     sample_loss = (token_loss * valid_mask).sum(dim=1) / safe_token_counts
-    active_mask = token_counts > 0
-    if not active_mask.any():
-        return sample_loss.new_zeros(())
-    weighted_losses = sample_loss[active_mask] * sample_weights[active_mask]
-    return weighted_losses.sum() / sample_weights[active_mask].sum().clamp_min(1e-8)
+    active_mask = (token_counts > 0).to(sample_loss.dtype)
+    weighted_losses = sample_loss * sample_weights * active_mask
+    return weighted_losses.sum() / (sample_weights * active_mask).sum().clamp_min(1e-8)
 
 
 def _classification_accuracy(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> float:
@@ -129,6 +127,7 @@ def compute_codec_loss(
     objective_config: CodecObjectiveConfig,
     device: torch.device,
     precision: str = "fp32",
+    compute_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     raw_codec = _unwrap_codec(codec)
     prefix_ids = batch["prefix_ids"].to(device, non_blocking=True)
@@ -148,9 +147,7 @@ def compute_codec_loss(
             sample_weights = _answer_sample_weights(batch, horizon, device, objective_config.answer_loss_weight)
             if target_tokens.size(1) == 0:
                 continue
-            active = horizon_mask[:, horizon].float().mean()
-            if active.item() == 0.0:
-                continue
+            active = horizon_mask[:, horizon].to(latent.dtype).mean()
 
             if horizon > 0:
                 continue
@@ -161,12 +158,13 @@ def compute_codec_loss(
                 sample_loss = _weighted_cross_entropy_loss(logits, targets, sample_weights)
                 weight = objective_config.horizon_weights[min(horizon, len(objective_config.horizon_weights) - 1)]
                 losses.append(weight * sample_loss * active)
-                metrics["token_h1_loss"] = sample_loss.detach().item()
-                metrics["token_h1_acc"] = masked_token_accuracy(
-                    logits.detach(),
-                    targets.detach(),
-                )
-                metrics["primary_loss"] = metrics["token_h1_loss"]
+                if compute_metrics:
+                    metrics["token_h1_loss"] = sample_loss.detach().item()
+                    metrics["token_h1_acc"] = masked_token_accuracy(
+                        logits.detach(),
+                        targets.detach(),
+                    )
+                    metrics["primary_loss"] = metrics["token_h1_loss"]
                 continue
 
             if objective_config.name == "decoder_token_mtp":
@@ -190,12 +188,14 @@ def compute_codec_loss(
                     ]
                     sample_loss = _weighted_cross_entropy_loss(logits, targets, sample_weights)
                     losses.append(weight * sample_loss * active)
-                    metrics[f"token_h{token_horizon}_loss"] = sample_loss.detach().item()
-                    metrics[f"token_h{token_horizon}_acc"] = masked_token_accuracy(
-                        logits.detach(),
-                        targets.detach(),
-                    )
-                metrics["primary_loss"] = metrics["token_h1_loss"]
+                    if compute_metrics:
+                        metrics[f"token_h{token_horizon}_loss"] = sample_loss.detach().item()
+                        metrics[f"token_h{token_horizon}_acc"] = masked_token_accuracy(
+                            logits.detach(),
+                            targets.detach(),
+                        )
+                if compute_metrics and "token_h1_loss" in metrics:
+                    metrics["primary_loss"] = metrics["token_h1_loss"]
                 continue
 
             raise ValueError(f"Unsupported codec objective: {objective_config.name}")
@@ -351,12 +351,35 @@ def _collect_valid_generations(
     return results
 
 
-def _maybe_wrap_ddp(codec: ReasoningCodec, dist_ctx: DistributedContext):
+def _maybe_wrap_ddp(codec: ReasoningCodec, dist_ctx: DistributedContext, static_graph: bool = True):
     if not dist_ctx.enabled:
         return codec
+    kwargs = {"find_unused_parameters": False, "static_graph": static_graph}
     if dist_ctx.device.type == "cuda":
-        return DDP(codec, device_ids=[dist_ctx.local_rank], output_device=dist_ctx.local_rank, find_unused_parameters=False)
-    return DDP(codec, find_unused_parameters=False)
+        try:
+            return DDP(codec, device_ids=[dist_ctx.local_rank], output_device=dist_ctx.local_rank, **kwargs)
+        except TypeError:
+            kwargs.pop("static_graph", None)
+            return DDP(codec, device_ids=[dist_ctx.local_rank], output_device=dist_ctx.local_rank, **kwargs)
+    try:
+        return DDP(codec, **kwargs)
+    except TypeError:
+        kwargs.pop("static_graph", None)
+        return DDP(codec, **kwargs)
+
+
+def _build_optimizer(model, config: ExperimentConfig, device: torch.device) -> torch.optim.Optimizer:
+    kwargs: dict[str, Any] = {
+        "lr": config.train.learning_rate,
+        "weight_decay": config.train.weight_decay,
+    }
+    if device.type == "cuda" and config.train.fused_optimizer:
+        kwargs["fused"] = True
+    try:
+        return torch.optim.AdamW(model.parameters(), **kwargs)
+    except TypeError:
+        kwargs.pop("fused", None)
+        return torch.optim.AdamW(model.parameters(), **kwargs)
 
 
 def _clip_grad_norm(model, max_norm: float) -> None:
@@ -408,6 +431,7 @@ def _build_compact_valid_entry(
         "primary_loss",
         "token_h1_loss",
         "token_h1_acc",
+        "step_acc",
         "answer_token_loss",
         "answer_token_acc",
         "answer_acc",
@@ -425,6 +449,148 @@ def _build_compact_valid_entry(
         if key in metrics:
             entry[key] = round(float(metrics[key]), 6)
     return entry
+
+
+def compute_sft_loss(
+    model: SFTLanguageModel,
+    batch: dict[str, torch.Tensor | list[str]],
+    device: torch.device,
+    precision: str,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    input_ids = batch["input_ids"].to(device, non_blocking=True)
+    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+    labels = batch["labels"].to(device, non_blocking=True)
+    autocast_dtype = _autocast_dtype(precision) if device.type == "cuda" else None
+
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+        logits = model(input_ids, attention_mask)
+        loss = _cross_entropy_loss(logits, labels)
+
+    metrics = {
+        "token_loss": loss.detach().item(),
+        "token_acc": masked_token_accuracy(logits.detach(), labels.detach()),
+        "primary_loss": loss.detach().item(),
+    }
+    return loss, metrics
+
+
+def _decode_sft_generated(
+    tokenizer,
+    generated_token_ids: torch.Tensor,
+) -> list[str]:
+    decoded: list[str] = []
+    eos_id = tokenizer.eos_token_id
+    for row in range(generated_token_ids.size(0)):
+        tokens = generated_token_ids[row].tolist()
+        if eos_id in tokens:
+            tokens = tokens[:tokens.index(eos_id)]
+        decoded.append(tokenizer.decode(tokens, skip_special_tokens=True).strip())
+    return decoded
+
+
+def evaluate_sft(
+    model: SFTLanguageModel,
+    loader,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> EpochResult:
+    model.eval()
+    total_loss = 0.0
+    count = 0
+    metric_sums: dict[str, float] = {}
+    step_correct = 0.0
+    step_total = 0.0
+    answer_correct = 0.0
+    answer_total = 0.0
+    tokenizer = loader.dataset.tokenizer
+    autocast_dtype = _autocast_dtype(config.train.precision) if device.type == "cuda" else None
+
+    with torch.no_grad():
+        for batch in loader:
+            loss, metrics = compute_sft_loss(model, batch, device, config.train.precision)
+            total_loss += loss.item()
+            count += 1
+            for key, value in metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value
+
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+                generated_token_ids, _ = model.generate_continuation(
+                    input_ids,
+                    attention_mask,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=config.data.max_step_tokens,
+                )
+            predictions = _decode_sft_generated(tokenizer, generated_token_ids)
+            for prediction, target_text, target_kind in zip(predictions, batch["target_texts"], batch["target_kinds"]):
+                if target_kind == "step":
+                    step_total += 1.0
+                    if _normalize_text(prediction) == _normalize_text(target_text):
+                        step_correct += 1.0
+                elif target_kind == "answer":
+                    answer_total += 1.0
+                    if _normalize_text(prediction) == _normalize_text(target_text):
+                        answer_correct += 1.0
+
+    if dist.is_available() and dist.is_initialized():
+        loss_tensor = torch.tensor([total_loss, count], device=device, dtype=torch.float64)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        total_loss = loss_tensor[0].item()
+        count = int(loss_tensor[1].item())
+        metric_sums = distributed_sum_dict(metric_sums, device)
+        counts = torch.tensor([step_correct, step_total, answer_correct, answer_total], device=device, dtype=torch.float64)
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        step_correct, step_total, answer_correct, answer_total = counts.tolist()
+
+    averaged = {key: value / max(count, 1) for key, value in metric_sums.items()}
+    if step_total > 0:
+        averaged["step_acc"] = step_correct / step_total
+        averaged["step_count"] = step_total
+    if answer_total > 0:
+        averaged["answer_acc"] = answer_correct / answer_total
+        averaged["answer_count"] = answer_total
+    return EpochResult(loss=total_loss / max(count, 1), metrics=averaged)
+
+
+def _collect_sft_valid_generations(
+    model: SFTLanguageModel,
+    loader,
+    config: ExperimentConfig,
+    device: torch.device,
+    max_examples: int,
+) -> list[dict[str, Any]]:
+    if max_examples <= 0:
+        return []
+    tokenizer = loader.dataset.tokenizer
+    results: list[dict[str, Any]] = []
+    autocast_dtype = _autocast_dtype(config.train.precision) if device.type == "cuda" else None
+
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+                generated_token_ids, finished = model.generate_continuation(
+                    input_ids,
+                    attention_mask,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=config.data.max_step_tokens,
+                )
+            predictions = _decode_sft_generated(tokenizer, generated_token_ids)
+            for idx, prediction in enumerate(predictions):
+                results.append(
+                    {
+                        "prompt_text": batch["prompt_texts"][idx],
+                        "target_kind": batch["target_kinds"][idx],
+                        "target_text": batch["target_texts"][idx],
+                        "predicted_text": prediction,
+                        "finished_with_eos": bool(finished[idx].item()),
+                    }
+                )
+                if len(results) >= max_examples:
+                    return results
+    return results
 
 
 def _flatten_active_transition_targets(
@@ -726,6 +892,7 @@ def compute_transition_loss(
     batch: dict[str, torch.Tensor | list[str] | list[list[str]]],
     config: ExperimentConfig,
     device: torch.device,
+    compute_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     raw_transition = transition_model.module if isinstance(transition_model, DDP) else transition_model
     question_ids = batch["question_ids"].to(device, non_blocking=True)
@@ -760,13 +927,15 @@ def compute_transition_loss(
             + config.transition.decode_loss_weight * decode_loss
         )
 
-    metrics = {
-        "type_loss": type_loss.detach().item(),
-        "decode_loss": decode_loss.detach().item(),
-        "type_acc": _classification_accuracy(next_type_logits.detach(), masked_type_labels.detach()),
-        "decode_token_acc": masked_token_accuracy(decode_logits.detach(), flat_target_labels.detach()),
-        "answer_rate": (flat_target_types == 1).float().mean().item() if flat_target_types.numel() > 0 else 0.0,
-    }
+    metrics = {}
+    if compute_metrics:
+        metrics = {
+            "type_loss": type_loss.detach().item(),
+            "decode_loss": decode_loss.detach().item(),
+            "type_acc": _classification_accuracy(next_type_logits.detach(), masked_type_labels.detach()),
+            "decode_token_acc": masked_token_accuracy(decode_logits.detach(), flat_target_labels.detach()),
+            "answer_rate": (flat_target_types == 1).float().mean().item() if flat_target_types.numel() > 0 else 0.0,
+        }
     return total_loss, metrics
 
 
@@ -954,12 +1123,8 @@ def train_codec(
     if config.model.init_checkpoint:
         raise ValueError("Experiment 1 only supports initialization via model.model_name_or_path. Leave model.init_checkpoint empty.")
     codec.to(device)
-    codec = _maybe_wrap_ddp(codec, dist_ctx)
-    optimizer = torch.optim.AdamW(
-        codec.parameters(),
-        lr=config.train.learning_rate,
-        weight_decay=config.train.weight_decay,
-    )
+    codec = _maybe_wrap_ddp(codec, dist_ctx, config.train.ddp_static_graph)
+    optimizer = _build_optimizer(codec, config, device)
     total_steps = config.train.epochs * len(loaders["train"])
     scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
@@ -978,12 +1143,22 @@ def train_codec(
             codec.train()
             progress = tqdm(loaders["train"], desc=f"codec epoch {epoch + 1}/{config.train.epochs}", disable=not dist_ctx.is_main_process)
             running_loss = 0.0
+            running_loss_tensor = torch.zeros((), device=device)
             metric_sums: dict[str, float] = {}
+            metric_steps = 0
             steps_in_epoch = 0
 
             for step, batch in enumerate(progress, start=1):
                 optimizer.zero_grad(set_to_none=True)
-                loss, metrics = compute_codec_loss(codec, batch, config.codec_objective, device, config.train.precision)
+                should_log_step = step % config.train.log_every == 0 or step == len(loaders["train"])
+                loss, metrics = compute_codec_loss(
+                    codec,
+                    batch,
+                    config.codec_objective,
+                    device,
+                    config.train.precision,
+                    compute_metrics=should_log_step,
+                )
                 loss.backward()
                 _clip_grad_norm(codec, config.train.grad_clip_norm)
                 optimizer.step()
@@ -992,26 +1167,39 @@ def train_codec(
 
                 global_step += 1
                 steps_in_epoch += 1
-                running_loss += loss.item()
-                step_loss_value = distributed_mean(loss.item(), device) if dist_ctx.enabled else loss.item()
-                if writer is not None:
-                    writer.add_scalar("train/step_loss", step_loss_value, global_step)
-                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-                _write_metrics(writer, "train_step", metrics, global_step)
-                for key, value in metrics.items():
-                    metric_sums[key] = metric_sums.get(key, 0.0) + value
+                running_loss_tensor += loss.detach()
 
-                if dist_ctx.is_main_process and (step % config.train.log_every == 0 or step == len(loaders["train"])):
+                if should_log_step:
+                    step_loss_value = distributed_mean(loss.detach().item(), device) if dist_ctx.enabled else loss.detach().item()
+                    running_loss = running_loss_tensor.item()
+                    if writer is not None:
+                        writer.add_scalar("train/step_loss", step_loss_value, global_step)
+                        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                    _write_metrics(writer, "train_step", metrics, global_step)
+                    if metrics:
+                        metric_steps += 1
+                        for key, value in metrics.items():
+                            metric_sums[key] = metric_sums.get(key, 0.0) + value
                     progress.set_postfix(loss=running_loss / step, **metrics)
 
             if dist_ctx.enabled:
-                loss_tensor = torch.tensor([running_loss, steps_in_epoch], device=device, dtype=torch.float64)
+                loss_tensor = torch.stack(
+                    [
+                        running_loss_tensor.to(torch.float64),
+                        torch.tensor(float(steps_in_epoch), device=device, dtype=torch.float64),
+                    ]
+                )
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
                 running_loss = loss_tensor[0].item()
                 steps_in_epoch = int(loss_tensor[1].item())
                 metric_sums = distributed_sum_dict(metric_sums, device)
+                metric_steps_tensor = torch.tensor(metric_steps, device=device, dtype=torch.long)
+                dist.all_reduce(metric_steps_tensor, op=dist.ReduceOp.SUM)
+                metric_steps = int(metric_steps_tensor.item())
+            else:
+                running_loss = running_loss_tensor.item()
 
-            averaged_train_metrics = {key: value / max(steps_in_epoch, 1) for key, value in metric_sums.items()}
+            averaged_train_metrics = {key: value / max(metric_steps, 1) for key, value in metric_sums.items()}
             train_result = EpochResult(loss=running_loss / max(steps_in_epoch, 1), metrics=averaged_train_metrics)
             valid_result = evaluate_codec(codec, loaders["valid"], config, device)
             if dist_ctx.is_main_process:
@@ -1074,12 +1262,8 @@ def train_transition(
     codec.requires_grad_(False)
 
     transition_model.to(device)
-    transition_model = _maybe_wrap_ddp(transition_model, dist_ctx)
-    optimizer = torch.optim.AdamW(
-        transition_model.parameters(),
-        lr=config.train.learning_rate,
-        weight_decay=config.train.weight_decay,
-    )
+    transition_model = _maybe_wrap_ddp(transition_model, dist_ctx, config.train.ddp_static_graph)
+    optimizer = _build_optimizer(transition_model, config, device)
     total_steps = config.train.epochs * len(loaders["train"])
     scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
@@ -1098,12 +1282,22 @@ def train_transition(
             transition_model.train()
             progress = tqdm(loaders["train"], desc=f"transition epoch {epoch + 1}/{config.train.epochs}", disable=not dist_ctx.is_main_process)
             running_loss = 0.0
+            running_loss_tensor = torch.zeros((), device=device)
             metric_sums: dict[str, float] = {}
+            metric_steps = 0
             steps_in_epoch = 0
 
             for step, batch in enumerate(progress, start=1):
                 optimizer.zero_grad(set_to_none=True)
-                loss, metrics = compute_transition_loss(transition_model, codec, batch, config, device)
+                should_log_step = step % config.train.log_every == 0 or step == len(loaders["train"])
+                loss, metrics = compute_transition_loss(
+                    transition_model,
+                    codec,
+                    batch,
+                    config,
+                    device,
+                    compute_metrics=should_log_step,
+                )
                 loss.backward()
                 _clip_grad_norm(transition_model, config.train.grad_clip_norm)
                 optimizer.step()
@@ -1112,26 +1306,39 @@ def train_transition(
 
                 global_step += 1
                 steps_in_epoch += 1
-                running_loss += loss.item()
-                step_loss_value = distributed_mean(loss.item(), device) if dist_ctx.enabled else loss.item()
-                if writer is not None:
-                    writer.add_scalar("train/step_loss", step_loss_value, global_step)
-                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-                _write_metrics(writer, "train_step", metrics, global_step)
-                for key, value in metrics.items():
-                    metric_sums[key] = metric_sums.get(key, 0.0) + value
+                running_loss_tensor += loss.detach()
 
-                if dist_ctx.is_main_process and (step % config.train.log_every == 0 or step == len(loaders["train"])):
+                if should_log_step:
+                    step_loss_value = distributed_mean(loss.detach().item(), device) if dist_ctx.enabled else loss.detach().item()
+                    running_loss = running_loss_tensor.item()
+                    if writer is not None:
+                        writer.add_scalar("train/step_loss", step_loss_value, global_step)
+                        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                    _write_metrics(writer, "train_step", metrics, global_step)
+                    if metrics:
+                        metric_steps += 1
+                        for key, value in metrics.items():
+                            metric_sums[key] = metric_sums.get(key, 0.0) + value
                     progress.set_postfix(loss=running_loss / step, **metrics)
 
             if dist_ctx.enabled:
-                loss_tensor = torch.tensor([running_loss, steps_in_epoch], device=device, dtype=torch.float64)
+                loss_tensor = torch.stack(
+                    [
+                        running_loss_tensor.to(torch.float64),
+                        torch.tensor(float(steps_in_epoch), device=device, dtype=torch.float64),
+                    ]
+                )
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
                 running_loss = loss_tensor[0].item()
                 steps_in_epoch = int(loss_tensor[1].item())
                 metric_sums = distributed_sum_dict(metric_sums, device)
+                metric_steps_tensor = torch.tensor(metric_steps, device=device, dtype=torch.long)
+                dist.all_reduce(metric_steps_tensor, op=dist.ReduceOp.SUM)
+                metric_steps = int(metric_steps_tensor.item())
+            else:
+                running_loss = running_loss_tensor.item()
 
-            averaged_train_metrics = {key: value / max(steps_in_epoch, 1) for key, value in metric_sums.items()}
+            averaged_train_metrics = {key: value / max(metric_steps, 1) for key, value in metric_sums.items()}
             train_result = EpochResult(loss=running_loss / max(steps_in_epoch, 1), metrics=averaged_train_metrics)
             valid_result = evaluate_transition(transition_model, codec, loaders["valid"], config, device)
             if dist_ctx.is_main_process:
@@ -1182,6 +1389,132 @@ def train_transition(
         if dist_ctx.is_main_process:
             save_json(output_dir / "transition_history.json", history)
             save_json(output_dir / "transition_valid_compact.json", valid_summary)
+        return best_path
+    finally:
+        if writer is not None:
+            writer.close()
+        cleanup_distributed()
+
+
+def train_sft(
+    model: SFTLanguageModel,
+    loaders,
+    config: ExperimentConfig,
+) -> Path:
+    dist_ctx = init_distributed(config.train.device, config.train.distributed_backend)
+    device = dist_ctx.device
+    configure_torch_runtime(device, config.train.allow_tf32)
+
+    model.to(device)
+    if dist_ctx.enabled:
+        if dist_ctx.device.type == "cuda":
+            model = DDP(
+                model,
+                device_ids=[dist_ctx.local_rank],
+                output_device=dist_ctx.local_rank,
+                find_unused_parameters=False,
+                static_graph=config.train.ddp_static_graph,
+            )
+        else:
+            model = DDP(model, find_unused_parameters=False)
+
+    optimizer_kwargs = {
+        "lr": config.train.learning_rate,
+        "weight_decay": config.train.weight_decay,
+    }
+    if config.train.fused_optimizer and device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
+    total_steps = config.train.epochs * len(loaders["train"])
+    scheduler = _build_scheduler(optimizer, config, total_steps)
+    output_dir = ensure_dir(config.train.output_dir)
+    best_path = output_dir / "sft_best.pt"
+    valid_generation_dir = ensure_dir(output_dir / "sft_valid_generations")
+    history: dict[str, list[dict[str, float]]] = {"train": [], "valid": []}
+    valid_summary: list[dict[str, float | int | str]] = []
+    best_valid = float("inf")
+    writer = _build_summary_writer(config, "sft", dist_ctx)
+    global_step = 0
+
+    try:
+        for epoch in range(config.train.epochs):
+            if dist_ctx.enabled and hasattr(loaders["train"], "sampler") and hasattr(loaders["train"].sampler, "set_epoch"):
+                loaders["train"].sampler.set_epoch(epoch)
+            model.train()
+            progress = tqdm(loaders["train"], desc=f"sft epoch {epoch + 1}/{config.train.epochs}", disable=not dist_ctx.is_main_process)
+            running_loss = 0.0
+            metric_sums: dict[str, float] = {}
+            steps_in_epoch = 0
+
+            for step, batch in enumerate(progress, start=1):
+                optimizer.zero_grad(set_to_none=True)
+                loss, metrics = compute_sft_loss(model.module if isinstance(model, DDP) else model, batch, device, config.train.precision)
+                loss.backward()
+                _clip_grad_norm(model, config.train.grad_clip_norm)
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+
+                global_step += 1
+                steps_in_epoch += 1
+                running_loss += loss.item()
+                step_loss_value = distributed_mean(loss.item(), device) if dist_ctx.enabled else loss.item()
+                if writer is not None:
+                    writer.add_scalar("train/step_loss", step_loss_value, global_step)
+                    writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                _write_metrics(writer, "train_step", metrics, global_step)
+                for key, value in metrics.items():
+                    metric_sums[key] = metric_sums.get(key, 0.0) + value
+
+                if dist_ctx.is_main_process and (step % config.train.log_every == 0 or step == len(loaders["train"])):
+                    progress.set_postfix(loss=running_loss / step, **metrics)
+
+            if dist_ctx.enabled:
+                loss_tensor = torch.tensor([running_loss, steps_in_epoch], device=device, dtype=torch.float64)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                running_loss = loss_tensor[0].item()
+                steps_in_epoch = int(loss_tensor[1].item())
+                metric_sums = distributed_sum_dict(metric_sums, device)
+
+            averaged_train_metrics = {key: value / max(steps_in_epoch, 1) for key, value in metric_sums.items()}
+            train_result = EpochResult(loss=running_loss / max(steps_in_epoch, 1), metrics=averaged_train_metrics)
+            valid_result = evaluate_sft(model.module if isinstance(model, DDP) else model, loaders["valid"], config, device)
+            if dist_ctx.is_main_process:
+                history["train"].append({"loss": train_result.loss, **train_result.metrics})
+                history["valid"].append({"loss": valid_result.loss, **valid_result.metrics})
+                valid_generations = _collect_sft_valid_generations(
+                    model.module if isinstance(model, DDP) else model,
+                    loaders["valid"],
+                    config,
+                    device,
+                    config.train.valid_generate_examples,
+                )
+                save_json(
+                    valid_generation_dir / f"epoch_{epoch + 1:03d}.json",
+                    {
+                        "epoch": epoch + 1,
+                        "experiment_name": config.experiment_name,
+                        "valid_loss": valid_result.loss,
+                        "valid_metrics": valid_result.metrics,
+                        "samples": valid_generations,
+                    },
+                )
+                valid_summary.append(_build_compact_valid_entry(epoch + 1, "sft", valid_result.loss, valid_result.metrics))
+            if dist_ctx.enabled:
+                dist.barrier()
+            if writer is not None:
+                writer.add_scalar("train/epoch_loss", train_result.loss, epoch + 1)
+                writer.add_scalar("valid/loss", valid_result.loss, epoch + 1)
+            _write_metrics(writer, "train_epoch", train_result.metrics, epoch + 1)
+            _write_metrics(writer, "valid", valid_result.metrics, epoch + 1)
+
+            if valid_result.loss < best_valid:
+                best_valid = valid_result.loss
+                _save_model_state(model, config, valid_result.metrics, best_path, dist_ctx)
+
+        if dist_ctx.is_main_process:
+            save_json(output_dir / "sft_history.json", history)
+            save_json(output_dir / "sft_valid_compact.json", valid_summary)
         return best_path
     finally:
         if writer is not None:

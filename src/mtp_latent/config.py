@@ -43,6 +43,7 @@ class ModelConfig:
     dropout: float = 0.1
     init_source: str = "ntp"
     init_checkpoint: str | None = None
+    attn_implementation: str | None = "flash_attention_2"
 
 
 @dataclass
@@ -69,6 +70,12 @@ class TransitionConfig:
 
 
 @dataclass
+class SFTConfig:
+    task: str = "next_step"
+    target_loss_weight: float = 1.0
+
+
+@dataclass
 class TrainConfig:
     epochs: int = 5
     learning_rate: float = 3e-4
@@ -86,6 +93,8 @@ class TrainConfig:
     scheduler: str = "cosine"
     warmup_ratio: float = 0.03
     min_lr_ratio: float = 0.1
+    fused_optimizer: bool = True
+    ddp_static_graph: bool = True
 
 
 @dataclass
@@ -95,6 +104,7 @@ class ExperimentConfig:
     model: ModelConfig
     codec_objective: CodecObjectiveConfig = field(default_factory=CodecObjectiveConfig)
     transition: TransitionConfig = field(default_factory=TransitionConfig)
+    sft: SFTConfig = field(default_factory=SFTConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
     @classmethod
@@ -106,6 +116,7 @@ class ExperimentConfig:
             model=ModelConfig(**raw["model"]),
             codec_objective=CodecObjectiveConfig(**raw.get("codec_objective", {})),
             transition=TransitionConfig(**raw.get("transition", {})),
+            sft=SFTConfig(**raw.get("sft", {})),
             train=TrainConfig(**raw.get("train", {})),
         )
         config.validate()
@@ -138,5 +149,6 @@ class ExperimentConfig:
             "model": self.model.__dict__,
             "codec_objective": self.codec_objective.__dict__,
             "transition": self.transition.__dict__,
+            "sft": self.sft.__dict__,
             "train": self.train.__dict__,
         }
