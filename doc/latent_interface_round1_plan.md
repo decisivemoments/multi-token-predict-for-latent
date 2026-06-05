@@ -115,20 +115,48 @@ valid 阶段单独统计：
 - 缓解每条 trace 里 answer 监督只出现一次、天然样本占比偏低的问题
 - 让模型在训练中更重视最终答案生成
 
+## transition 接口当前结论
+
+在继续观察 transition 训练之后，我们把接口形式先收回到更保守、也更容易验证的一版：
+
+1. `latent_in_proj` 不应该随机初始化  
+   因为当前已经统一 `latent_dim = hidden_dim = 768`，更自然的做法是：
+   - `latent_in_proj` identity init
+   - 让输入 latent token 在训练初期尽量无扭曲地进入 transition backbone
+
+2. `latent_out_proj` 先使用 plain projection  
+   当前先不再假设：
+   - `predicted_latent = h + delta(h)`
+
+   而是回到更保守的：
+   - `predicted_latent = latent_out_proj(h)`
+
+3. `latent_out_proj` 先使用 identity init  
+   这样初始时：
+   - `latent_out_proj(h) ≈ h`
+
+   这个版本保留了“输出先接近恒等映射”的好处，但不会像 hidden-state residual 那样把模型结构绑定在一个过强的先验上。
+
+这样初始时：
+
+- `latent_in_proj(z) ≈ z`
+- `predicted_latent ≈ h`
+
+当前这版的核心想法是：
+
+> 先让输出接口从近似恒等映射开始，再由训练自己决定如何把 transition hidden state 映射到 codec latent manifold。
+
 ## 当前不包含的内容
 
 这些放到下一轮再做：
 
-1. transition 的 residual latent update  
-   在 latent 位置使用：
-   `predicted_latent = input_latent + delta`
-
-2. transition 接口对照实验  
+1. transition 接口对照实验  
    包括：
    - direct latent passing
-   - residual vs non-residual
+   - hidden-state residual vs plain projection
+   - input-latent residual vs hidden-state residual
 
-3. 更宽松的 answer 评估  
+2. 更宽松的 answer 评估  
    例如：
    - numeric answer match
    - value-only correctness
@@ -159,11 +187,12 @@ valid 阶段单独统计：
 
 ## 下一轮方向
 
-如果第一轮后 codec 明显改善，但 transition 仍然弱，下一轮最自然的结构改动是：
+如果 plain projection + identity init 之后，transition 仍然明显下不去，下一轮最自然的实验就是做更明确的接口对照：
 
-- `q_n -> latent` 继续使用普通投影
-- `z_i -> z_{i+1}` 的 latent 位置改成 residual update
+- plain projection：`predicted_latent = W h`
+- hidden-state residual：`predicted_latent = h + W h`
+- input-latent residual：`predicted_latent = z_i + W h(z_i)`
 
-这样可以更直接地测试：
+这样可以直接比较：
 
-> transition 更适合被建模成“latent 状态更新器”，还是“从零生成下一个 latent 的模型”。
+> transition 更像是在“修正当前 hidden state”，还是在“更新已有 latent 状态”。

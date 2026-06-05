@@ -32,6 +32,13 @@ def _maybe_identity_init(linear: nn.Linear) -> None:
             nn.init.zeros_(linear.bias)
 
 
+def _zero_init(linear: nn.Linear) -> None:
+    with torch.no_grad():
+        nn.init.zeros_(linear.weight)
+        if linear.bias is not None:
+            nn.init.zeros_(linear.bias)
+
+
 class ReasoningCodec(nn.Module):
     def __init__(self, model_config: ModelConfig, pad_token_id: int) -> None:
         super().__init__()
@@ -246,6 +253,8 @@ class ReasoningTransitionModel(nn.Module):
         self.latent_in_proj = nn.Linear(model_config.latent_dim, transition_hidden_dim)
         self.latent_out_proj = nn.Linear(transition_hidden_dim, model_config.latent_dim)
         self.next_type_head = nn.Linear(transition_hidden_dim, 2)
+        _maybe_identity_init(self.latent_in_proj)
+        _maybe_identity_init(self.latent_out_proj)
 
     def forward(
         self,

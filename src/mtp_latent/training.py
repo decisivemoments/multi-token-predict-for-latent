@@ -58,6 +58,20 @@ def _write_metrics(writer: SummaryWriter | None, prefix: str, metrics: dict[str,
         writer.add_scalar(f"{prefix}/{key}", value, step)
 
 
+def _progress_metrics(stage: str, metrics: dict[str, float]) -> dict[str, float]:
+    if stage == "transition":
+        keys = [
+            "type_loss",
+            "decode_loss",
+            "latent_loss",
+            "type_acc",
+            "decode_token_acc",
+            "answer_rate",
+        ]
+        return {key: metrics[key] for key in keys if key in metrics}
+    return metrics
+
+
 def _cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor, ignore_index: int = -100) -> torch.Tensor:
     return nn.functional.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
@@ -95,6 +109,52 @@ def _classification_accuracy(logits: torch.Tensor, targets: torch.Tensor, ignore
         return 0.0
     correct = ((predictions == targets) & mask).sum().item()
     return correct / total
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(values.dtype)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def _masked_huber_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    delta: float,
+) -> torch.Tensor:
+    per_example = nn.functional.huber_loss(predictions, targets, reduction="none", delta=delta).mean(dim=-1)
+    return _masked_mean(per_example, mask)
+
+
+def _info_nce_loss(predictions: torch.Tensor, targets: torch.Tensor, temperature: float) -> torch.Tensor:
+    normalized_predictions = nn.functional.normalize(predictions, dim=-1)
+    normalized_targets = nn.functional.normalize(targets, dim=-1)
+    logits = normalized_predictions @ normalized_targets.transpose(0, 1)
+    logits = logits / temperature
+    labels = torch.arange(logits.size(0), device=logits.device)
+    return nn.functional.cross_entropy(logits, labels)
+
+
+def _within_question_info_nce_loss(
+    predicted_latents: torch.Tensor,
+    latent_targets: torch.Tensor,
+    latent_target_mask: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    losses: list[torch.Tensor] = []
+    for row in range(predicted_latents.size(0)):
+        valid_positions = torch.nonzero(latent_target_mask[row], as_tuple=False).flatten()
+        if valid_positions.numel() < 2:
+            continue
+        normalized_predictions = nn.functional.normalize(predicted_latents[row, valid_positions], dim=-1)
+        normalized_targets = nn.functional.normalize(latent_targets[row, valid_positions], dim=-1)
+        logits = normalized_predictions @ normalized_targets.transpose(0, 1)
+        logits = logits / temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        losses.append(nn.functional.cross_entropy(logits, labels))
+    if losses:
+        return torch.stack(losses).mean()
+    return predicted_latents.new_zeros(())
 
 
 def _autocast_dtype(precision: str) -> torch.dtype | None:
@@ -416,6 +476,17 @@ def _build_scheduler(optimizer: torch.optim.Optimizer, config: ExperimentConfig,
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def _num_update_steps_per_epoch(num_batches: int, grad_accum_steps: int) -> int:
+    return max(math.ceil(num_batches / max(grad_accum_steps, 1)), 1)
+
+
+def _current_accum_divisor(step: int, num_batches: int, grad_accum_steps: int) -> int:
+    micro_step_in_accum = (step - 1) % grad_accum_steps + 1
+    if step == num_batches and micro_step_in_accum != grad_accum_steps:
+        return micro_step_in_accum
+    return grad_accum_steps
+
+
 def _build_compact_valid_entry(
     epoch: int,
     stage: str,
@@ -437,18 +508,98 @@ def _build_compact_valid_entry(
         "answer_acc",
         "type_loss",
         "decode_loss",
+        "latent_loss",
+        "infonce_loss",
+        "latent_huber_loss",
         "type_acc",
         "decode_token_acc",
+        "pred_vs_target_latent_cosine",
+        "pred_vs_target_latent_mse",
+        "pred_vs_random_target_latent_cosine",
         "teacher_forced_answer_acc",
         "rollout_direct_answer_acc",
         "rollout_direct_answer_stop_rate",
-        "rollout_reencode_answer_acc",
-        "rollout_reencode_answer_stop_rate",
     ]
     for key in preferred_keys:
         if key in metrics:
             entry[key] = round(float(metrics[key]), 6)
     return entry
+
+
+def _build_compact_valid_report(
+    experiment_name: str,
+    stage: str,
+    entries: list[dict[str, float | int | str]],
+) -> dict[str, Any]:
+    if not entries:
+        return {
+            "experiment_name": experiment_name,
+            "stage": stage,
+            "epoch_count": 0,
+            "latest": None,
+            "best_by_loss": None,
+            "best_by_metric": {},
+            "recent_epochs": [],
+        }
+
+    minimize_metrics = {
+        "loss",
+        "primary_loss",
+        "token_h1_loss",
+        "answer_token_loss",
+        "type_loss",
+        "decode_loss",
+        "latent_loss",
+        "infonce_loss",
+        "latent_huber_loss",
+    }
+    maximize_metrics = {
+        "token_h1_acc",
+        "step_acc",
+        "answer_token_acc",
+        "answer_acc",
+        "type_acc",
+        "decode_token_acc",
+        "pred_vs_target_latent_cosine",
+        "pred_vs_target_latent_mse",
+        "pred_vs_random_target_latent_cosine",
+        "teacher_forced_answer_acc",
+        "rollout_direct_answer_acc",
+        "rollout_direct_answer_stop_rate",
+    }
+
+    best_by_loss = min(entries, key=lambda entry: float(entry["loss"]))
+    best_by_metric: dict[str, dict[str, float | int]] = {}
+
+    metric_keys = [
+        key
+        for key in entries[0].keys()
+        if key not in {"epoch", "stage"}
+    ]
+    for key in metric_keys:
+        if key in minimize_metrics:
+            best_entry = min(entries, key=lambda entry: float(entry[key]))
+        elif key in maximize_metrics:
+            best_entry = max(entries, key=lambda entry: float(entry[key]))
+        else:
+            continue
+        best_by_metric[key] = {
+            "epoch": int(best_entry["epoch"]),
+            "value": float(best_entry[key]),
+        }
+
+    return {
+        "experiment_name": experiment_name,
+        "stage": stage,
+        "epoch_count": len(entries),
+        "latest": entries[-1],
+        "best_by_loss": {
+            "epoch": int(best_by_loss["epoch"]),
+            "loss": float(best_by_loss["loss"]),
+        },
+        "best_by_metric": best_by_metric,
+        "recent_epochs": entries[-5:],
+    }
 
 
 def compute_sft_loss(
@@ -608,14 +759,35 @@ def _flatten_active_transition_targets(
     )
 
 
+def _build_transition_latent_targets(
+    latent_inputs: torch.Tensor,
+    target_type_labels: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, max_targets = target_type_labels.shape
+    latent_dim = latent_inputs.size(-1) if latent_inputs.dim() == 3 and latent_inputs.size(1) > 0 else 0
+    latent_targets = torch.zeros(
+        (batch_size, max_targets, latent_dim),
+        device=latent_inputs.device,
+        dtype=latent_inputs.dtype,
+    )
+    latent_target_mask = torch.zeros((batch_size, max_targets), device=latent_inputs.device, dtype=torch.bool)
+    max_available = min(latent_inputs.size(1), max_targets)
+    if max_available > 0:
+        latent_targets[:, :max_available, :] = latent_inputs[:, :max_available, :]
+        latent_target_mask[:, :max_available] = target_type_labels[:, :max_available] == 0
+    return latent_targets, latent_target_mask
+
+
 def _encode_transition_latents(
     codec: ReasoningCodec,
     batch: dict[str, torch.Tensor | list[str] | list[list[str]]],
     device: torch.device,
+    precision: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     latent_prefix_ids = batch["latent_prefix_ids"].to(device, non_blocking=True)
     latent_prefix_mask = batch["latent_prefix_mask"].to(device, non_blocking=True)
     latent_mask = batch["latent_mask"].to(device, non_blocking=True)
+    autocast_dtype = _autocast_dtype(precision) if device.type == "cuda" else None
 
     batch_size, max_latents, seq_len = latent_prefix_ids.shape
     if max_latents == 0:
@@ -633,7 +805,8 @@ def _encode_transition_latents(
     if flat_active_mask.any():
         active_prefix_ids = flat_prefix_ids[flat_active_mask]
         active_prefix_mask = flat_prefix_mask[flat_active_mask]
-        encoded_latents = codec.encode(active_prefix_ids, active_prefix_mask)
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+            encoded_latents = codec.encode(active_prefix_ids, active_prefix_mask)
         flat_latents[flat_active_mask] = encoded_latents.to(flat_latents.dtype)
     return flat_latents.view(batch_size, max_latents, -1), latent_mask
 
@@ -706,12 +879,16 @@ def _decode_latent_text(
     tokenizer,
     latent: torch.Tensor,
     max_step_tokens: int,
+    precision: str,
 ) -> tuple[str, bool]:
-    generated_token_ids, finished = codec.generate_step(
-        latent,
-        eos_token_id=tokenizer.eos_token_id,
-        max_new_tokens=max_step_tokens,
-    )
+    device = latent.device
+    autocast_dtype = _autocast_dtype(precision) if device.type == "cuda" else None
+    with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+        generated_token_ids, finished = codec.generate_step(
+            latent,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=max_step_tokens,
+        )
     decoded_text = _decode_generated_tokens(tokenizer, generated_token_ids)[0]
     return decoded_text, bool(finished[0].item())
 
@@ -745,7 +922,13 @@ def _rollout_transition_answer(
             config,
             device,
         )
-        decoded_text, finished = _decode_latent_text(codec, tokenizer, predicted_latent, config.data.max_step_tokens)
+        decoded_text, finished = _decode_latent_text(
+            codec,
+            tokenizer,
+            predicted_latent,
+            config.data.max_step_tokens,
+            config.train.precision,
+        )
         if predicted_type == 1:
             answer_text = decoded_text
             answer_finished = finished
@@ -803,7 +986,7 @@ def _evaluate_transition_rollout_metrics(
         for batch in loader:
             question_ids = batch["question_ids"].to(device, non_blocking=True)
             question_mask = batch["question_mask"].to(device, non_blocking=True)
-            latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device)
+            latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device, config.train.precision)
             autocast_dtype = _autocast_dtype(config.train.precision) if device.type == "cuda" else None
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
                 _, predicted_latents, supervision_mask = raw_transition(
@@ -823,7 +1006,13 @@ def _evaluate_transition_rollout_metrics(
 
                 answer_position = valid_positions - 1
                 teacher_forced_latent = predicted_latents[batch_index, answer_position].unsqueeze(0)
-                teacher_forced_prediction, _ = _decode_latent_text(codec, tokenizer, teacher_forced_latent, config.data.max_step_tokens)
+                teacher_forced_prediction, _ = _decode_latent_text(
+                    codec,
+                    tokenizer,
+                    teacher_forced_latent,
+                    config.data.max_step_tokens,
+                    config.train.precision,
+                )
                 counts["teacher_forced_answer_total"] += 1.0
                 if _normalize_text(teacher_forced_prediction) == _normalize_text(answer_text):
                     counts["teacher_forced_answer_correct"] += 1.0
@@ -903,7 +1092,7 @@ def compute_transition_loss(
     autocast_dtype = _autocast_dtype(config.train.precision) if device.type == "cuda" else None
 
     with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-        latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device)
+        latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device, config.train.precision)
         next_type_logits, predicted_latents, supervision_mask = raw_transition(
             question_ids,
             question_mask,
@@ -922,9 +1111,62 @@ def compute_transition_loss(
         decode_logits = codec.decode(flat_predicted_latents, flat_target_tokens)
         decode_loss = _cross_entropy_loss(decode_logits, flat_target_labels)
 
+        latent_targets, latent_target_mask = _build_transition_latent_targets(latent_inputs, target_type_labels)
+        zero = predicted_latents.new_zeros(())
+        if latent_target_mask.any():
+            cosine_scores = nn.functional.cosine_similarity(predicted_latents, latent_targets, dim=-1)
+            cosine_latent_loss = _masked_mean(1.0 - cosine_scores, latent_target_mask)
+            latent_mse = _masked_mean(
+                ((predicted_latents - latent_targets) ** 2).mean(dim=-1),
+                latent_target_mask,
+            )
+            latent_huber_loss = _masked_huber_loss(
+                predicted_latents,
+                latent_targets,
+                latent_target_mask,
+                delta=config.transition.latent_huber_delta,
+            )
+            pred_vs_target_latent_cosine = _masked_mean(cosine_scores, latent_target_mask)
+            flat_predicted_next = predicted_latents[latent_target_mask]
+            flat_target_next = latent_targets[latent_target_mask]
+            infonce_loss = _within_question_info_nce_loss(
+                predicted_latents,
+                latent_targets,
+                latent_target_mask,
+                temperature=config.transition.latent_infonce_temperature,
+            )
+            if flat_target_next.size(0) > 1:
+                pred_vs_random_target_latent_cosine = nn.functional.cosine_similarity(
+                    flat_predicted_next,
+                    flat_target_next.roll(shifts=1, dims=0),
+                    dim=-1,
+                ).mean()
+            else:
+                pred_vs_random_target_latent_cosine = predicted_latents.new_zeros(())
+        else:
+            cosine_latent_loss = zero
+            latent_mse = zero
+            latent_huber_loss = zero
+            infonce_loss = zero
+            pred_vs_target_latent_cosine = zero
+            pred_vs_random_target_latent_cosine = zero
+
+        latent_loss_type = config.transition.latent_loss_type
+        if latent_loss_type == "cosine":
+            latent_loss = cosine_latent_loss
+        elif latent_loss_type == "cosine_huber":
+            latent_loss = cosine_latent_loss + config.transition.latent_huber_weight * latent_huber_loss
+        elif latent_loss_type == "infonce":
+            latent_loss = infonce_loss
+        elif latent_loss_type == "infonce_huber":
+            latent_loss = infonce_loss + config.transition.latent_huber_weight * latent_huber_loss
+        else:
+            raise ValueError(f"Unsupported transition.latent_loss_type={latent_loss_type}")
+
         total_loss = (
             config.transition.type_loss_weight * type_loss
             + config.transition.decode_loss_weight * decode_loss
+            + config.transition.latent_loss_weight * latent_loss
         )
 
     metrics = {}
@@ -932,8 +1174,14 @@ def compute_transition_loss(
         metrics = {
             "type_loss": type_loss.detach().item(),
             "decode_loss": decode_loss.detach().item(),
+            "latent_loss": latent_loss.detach().item(),
+            "infonce_loss": infonce_loss.detach().item(),
+            "latent_huber_loss": latent_huber_loss.detach().item(),
             "type_acc": _classification_accuracy(next_type_logits.detach(), masked_type_labels.detach()),
             "decode_token_acc": masked_token_accuracy(decode_logits.detach(), flat_target_labels.detach()),
+            "pred_vs_target_latent_cosine": pred_vs_target_latent_cosine.detach().item(),
+            "pred_vs_target_latent_mse": latent_mse.detach().item(),
+            "pred_vs_random_target_latent_cosine": pred_vs_random_target_latent_cosine.detach().item(),
             "answer_rate": (flat_target_types == 1).float().mean().item() if flat_target_types.numel() > 0 else 0.0,
         }
     return total_loss, metrics
@@ -991,7 +1239,7 @@ def _collect_transition_valid_generations(
             question_ids = batch["question_ids"].to(device, non_blocking=True)
             question_mask = batch["question_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-                latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device)
+                latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device, config.train.precision)
                 next_type_logits, predicted_latents, supervision_mask = raw_transition(
                     question_ids,
                     question_mask,
@@ -1004,12 +1252,13 @@ def _collect_transition_valid_generations(
                 valid_positions = int(supervision_mask[batch_index].sum().item())
                 for position_index in range(valid_positions):
                     predicted_latent = predicted_latents[batch_index, position_index].unsqueeze(0)
-                    generated_token_ids, finished = codec.generate_step(
+                    predicted_text, finished_with_eos = _decode_latent_text(
+                        codec,
+                        tokenizer,
                         predicted_latent,
-                        eos_token_id=tokenizer.eos_token_id,
-                        max_new_tokens=config.data.max_step_tokens,
+                        config.data.max_step_tokens,
+                        config.train.precision,
                     )
-                    predicted_text = _decode_generated_tokens(tokenizer, generated_token_ids)[0]
                     gold_type = batch["target_kinds"][batch_index][position_index]
                     gold_text = batch["target_texts"][batch_index][position_index]
                     results.append(
@@ -1020,7 +1269,7 @@ def _collect_transition_valid_generations(
                             "predicted_type": "answer" if int(predicted_types[batch_index, position_index].item()) == 1 else "step",
                             "gold_text": gold_text,
                             "predicted_text": predicted_text,
-                            "finished_with_eos": bool(finished[0].item()),
+                            "finished_with_eos": finished_with_eos,
                         }
                     )
                     if len(results) >= max_examples:
@@ -1048,7 +1297,7 @@ def _collect_transition_rollout_samples(
             question_ids = batch["question_ids"].to(device, non_blocking=True)
             question_mask = batch["question_mask"].to(device, non_blocking=True)
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-                latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device)
+                latent_inputs, latent_mask = _encode_transition_latents(codec, batch, device, config.train.precision)
                 _, predicted_latents, supervision_mask = raw_transition(
                     question_ids,
                     question_mask,
@@ -1070,6 +1319,7 @@ def _collect_transition_rollout_samples(
                         tokenizer,
                         teacher_forced_latent,
                         config.data.max_step_tokens,
+                        config.train.precision,
                     )
                 else:
                     teacher_forced_finished = False
@@ -1125,7 +1375,10 @@ def train_codec(
     codec.to(device)
     codec = _maybe_wrap_ddp(codec, dist_ctx, config.train.ddp_static_graph)
     optimizer = _build_optimizer(codec, config, device)
-    total_steps = config.train.epochs * len(loaders["train"])
+    total_steps = config.train.epochs * _num_update_steps_per_epoch(
+        len(loaders["train"]),
+        config.train.grad_accum_steps,
+    )
     scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
     best_path = output_dir / "codec_best.pt"
@@ -1147,10 +1400,12 @@ def train_codec(
             metric_sums: dict[str, float] = {}
             metric_steps = 0
             steps_in_epoch = 0
+            optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(progress, start=1):
-                optimizer.zero_grad(set_to_none=True)
                 should_log_step = step % config.train.log_every == 0 or step == len(loaders["train"])
+                should_step = step % config.train.grad_accum_steps == 0 or step == len(loaders["train"])
+                accum_steps = _current_accum_divisor(step, len(loaders["train"]), config.train.grad_accum_steps)
                 loss, metrics = compute_codec_loss(
                     codec,
                     batch,
@@ -1159,15 +1414,17 @@ def train_codec(
                     config.train.precision,
                     compute_metrics=should_log_step,
                 )
-                loss.backward()
-                _clip_grad_norm(codec, config.train.grad_clip_norm)
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-
-                global_step += 1
+                (loss / accum_steps).backward()
                 steps_in_epoch += 1
                 running_loss_tensor += loss.detach()
+
+                if should_step:
+                    _clip_grad_norm(codec, config.train.grad_clip_norm)
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
 
                 if should_log_step:
                     step_loss_value = distributed_mean(loss.detach().item(), device) if dist_ctx.enabled else loss.detach().item()
@@ -1180,7 +1437,7 @@ def train_codec(
                         metric_steps += 1
                         for key, value in metrics.items():
                             metric_sums[key] = metric_sums.get(key, 0.0) + value
-                    progress.set_postfix(loss=running_loss / step, **metrics)
+                    progress.set_postfix(loss=running_loss / step, **_progress_metrics("codec", metrics))
 
             if dist_ctx.enabled:
                 loss_tensor = torch.stack(
@@ -1225,6 +1482,10 @@ def train_codec(
                 valid_summary.append(
                     _build_compact_valid_entry(epoch + 1, "codec", valid_result.loss, valid_result.metrics)
                 )
+                save_json(
+                    output_dir / "codec_valid_compact.json",
+                    _build_compact_valid_report(config.experiment_name, "codec", valid_summary),
+                )
             if dist_ctx.enabled:
                 dist.barrier()
             if writer is not None:
@@ -1239,7 +1500,6 @@ def train_codec(
 
         if dist_ctx.is_main_process:
             save_json(output_dir / "codec_history.json", history)
-            save_json(output_dir / "codec_valid_compact.json", valid_summary)
         return best_path
     finally:
         if writer is not None:
@@ -1264,7 +1524,10 @@ def train_transition(
     transition_model.to(device)
     transition_model = _maybe_wrap_ddp(transition_model, dist_ctx, config.train.ddp_static_graph)
     optimizer = _build_optimizer(transition_model, config, device)
-    total_steps = config.train.epochs * len(loaders["train"])
+    total_steps = config.train.epochs * _num_update_steps_per_epoch(
+        len(loaders["train"]),
+        config.train.grad_accum_steps,
+    )
     scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
     best_path = output_dir / "transition_best.pt"
@@ -1286,10 +1549,12 @@ def train_transition(
             metric_sums: dict[str, float] = {}
             metric_steps = 0
             steps_in_epoch = 0
+            optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(progress, start=1):
-                optimizer.zero_grad(set_to_none=True)
                 should_log_step = step % config.train.log_every == 0 or step == len(loaders["train"])
+                should_step = step % config.train.grad_accum_steps == 0 or step == len(loaders["train"])
+                accum_steps = _current_accum_divisor(step, len(loaders["train"]), config.train.grad_accum_steps)
                 loss, metrics = compute_transition_loss(
                     transition_model,
                     codec,
@@ -1298,15 +1563,17 @@ def train_transition(
                     device,
                     compute_metrics=should_log_step,
                 )
-                loss.backward()
-                _clip_grad_norm(transition_model, config.train.grad_clip_norm)
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-
-                global_step += 1
+                (loss / accum_steps).backward()
                 steps_in_epoch += 1
                 running_loss_tensor += loss.detach()
+
+                if should_step:
+                    _clip_grad_norm(transition_model, config.train.grad_clip_norm)
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
 
                 if should_log_step:
                     step_loss_value = distributed_mean(loss.detach().item(), device) if dist_ctx.enabled else loss.detach().item()
@@ -1319,7 +1586,7 @@ def train_transition(
                         metric_steps += 1
                         for key, value in metrics.items():
                             metric_sums[key] = metric_sums.get(key, 0.0) + value
-                    progress.set_postfix(loss=running_loss / step, **metrics)
+                    progress.set_postfix(loss=running_loss / step, **_progress_metrics("transition", metrics))
 
             if dist_ctx.enabled:
                 loss_tensor = torch.stack(
@@ -1374,6 +1641,10 @@ def train_transition(
                 valid_summary.append(
                     _build_compact_valid_entry(epoch + 1, "transition", valid_result.loss, valid_result.metrics)
                 )
+                save_json(
+                    output_dir / "transition_valid_compact.json",
+                    _build_compact_valid_report(config.experiment_name, "transition", valid_summary),
+                )
             if dist_ctx.enabled:
                 dist.barrier()
             if writer is not None:
@@ -1388,7 +1659,6 @@ def train_transition(
 
         if dist_ctx.is_main_process:
             save_json(output_dir / "transition_history.json", history)
-            save_json(output_dir / "transition_valid_compact.json", valid_summary)
         return best_path
     finally:
         if writer is not None:
@@ -1425,7 +1695,10 @@ def train_sft(
     if config.train.fused_optimizer and device.type == "cuda":
         optimizer_kwargs["fused"] = True
     optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
-    total_steps = config.train.epochs * len(loaders["train"])
+    total_steps = config.train.epochs * _num_update_steps_per_epoch(
+        len(loaders["train"]),
+        config.train.grad_accum_steps,
+    )
     scheduler = _build_scheduler(optimizer, config, total_steps)
     output_dir = ensure_dir(config.train.output_dir)
     best_path = output_dir / "sft_best.pt"
@@ -1445,19 +1718,24 @@ def train_sft(
             running_loss = 0.0
             metric_sums: dict[str, float] = {}
             steps_in_epoch = 0
+            optimizer.zero_grad(set_to_none=True)
 
             for step, batch in enumerate(progress, start=1):
-                optimizer.zero_grad(set_to_none=True)
+                should_step = step % config.train.grad_accum_steps == 0 or step == len(loaders["train"])
+                accum_steps = _current_accum_divisor(step, len(loaders["train"]), config.train.grad_accum_steps)
                 loss, metrics = compute_sft_loss(model.module if isinstance(model, DDP) else model, batch, device, config.train.precision)
-                loss.backward()
-                _clip_grad_norm(model, config.train.grad_clip_norm)
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-
-                global_step += 1
+                (loss / accum_steps).backward()
                 steps_in_epoch += 1
                 running_loss += loss.item()
+
+                if should_step:
+                    _clip_grad_norm(model, config.train.grad_clip_norm)
+                    optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
                 step_loss_value = distributed_mean(loss.item(), device) if dist_ctx.enabled else loss.item()
                 if writer is not None:
                     writer.add_scalar("train/step_loss", step_loss_value, global_step)
@@ -1467,7 +1745,7 @@ def train_sft(
                     metric_sums[key] = metric_sums.get(key, 0.0) + value
 
                 if dist_ctx.is_main_process and (step % config.train.log_every == 0 or step == len(loaders["train"])):
-                    progress.set_postfix(loss=running_loss / step, **metrics)
+                    progress.set_postfix(loss=running_loss / step, **_progress_metrics("sft", metrics))
 
             if dist_ctx.enabled:
                 loss_tensor = torch.tensor([running_loss, steps_in_epoch], device=device, dtype=torch.float64)
@@ -1500,6 +1778,10 @@ def train_sft(
                     },
                 )
                 valid_summary.append(_build_compact_valid_entry(epoch + 1, "sft", valid_result.loss, valid_result.metrics))
+                save_json(
+                    output_dir / "sft_valid_compact.json",
+                    _build_compact_valid_report(config.experiment_name, "sft", valid_summary),
+                )
             if dist_ctx.enabled:
                 dist.barrier()
             if writer is not None:
@@ -1514,7 +1796,6 @@ def train_sft(
 
         if dist_ctx.is_main_process:
             save_json(output_dir / "sft_history.json", history)
-            save_json(output_dir / "sft_valid_compact.json", valid_summary)
         return best_path
     finally:
         if writer is not None:

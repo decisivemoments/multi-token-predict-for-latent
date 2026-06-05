@@ -18,6 +18,32 @@ def _load_codec_for_eval(codec: ReasoningCodec, checkpoint_path: str) -> None:
     codec.load_state_dict(state["model_state"])
 
 
+def _init_transition_backbone_from_encoder_checkpoint(
+    transition_model: ReasoningTransitionModel,
+    checkpoint_path: str,
+) -> None:
+    state = torch.load(checkpoint_path, map_location="cpu")
+    model_state = state["model_state"]
+    encoder_state = {
+        key[len("encoder.") :]: value
+        for key, value in model_state.items()
+        if key.startswith("encoder.")
+    }
+    if not encoder_state:
+        raise ValueError(f"No encoder.* weights found in checkpoint: {checkpoint_path}")
+    load_result = transition_model.backbone.load_state_dict(encoder_state, strict=False)
+    if load_result.unexpected_keys:
+        raise ValueError(
+            f"Unexpected encoder keys while initializing transition backbone from {checkpoint_path}: "
+            f"{load_result.unexpected_keys}"
+        )
+    if load_result.missing_keys:
+        print(
+            "Warning: missing backbone keys during encoder initialization:",
+            ", ".join(load_result.missing_keys),
+        )
+
+
 def run_train_codec(config_path: str) -> None:
     config = ExperimentConfig.from_yaml(config_path)
     set_seed(config.train.seed)
@@ -57,6 +83,11 @@ def run_train_transition(config_path: str) -> None:
         )
         config.model.vocab_size = len(transition_tokenizer)
         transition_model = ReasoningTransitionModel(config.model, config.transition, vocab_size=len(transition_tokenizer))
+        if config.transition.encoder_init_checkpoint:
+            _init_transition_backbone_from_encoder_checkpoint(
+                transition_model,
+                config.transition.encoder_init_checkpoint,
+            )
         if config.transition.init_checkpoint:
             state = torch.load(config.transition.init_checkpoint, map_location="cpu")
             transition_model.load_state_dict(state["model_state"])

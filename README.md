@@ -61,6 +61,7 @@ pip install -r requirements.txt
 - `decode`: 把 latent 投影成一个 prefix embedding，拼到 GPT-2 decoder 输入前面
 - `train.device`: 支持 `auto`、`cuda`、`cuda:0`、`cpu`
 - `torchrun + DDP`: 支持多卡并行；单卡命令语义保持不变
+- `train.grad_accum_steps`: 支持梯度累计，方便在 `small/xl` 间保持相近的有效 batch size
 - `train-transition`: 支持基于冻结 codec 的 transition 训练
 - `train-sft`: 支持 ProsQA/GSM 风格的普通 SFT sanity check
 
@@ -128,7 +129,14 @@ outputs/<experiment_name>/valid_generations/epoch_001.json
 outputs/<experiment_name>/codec_valid_compact.json
 ```
 
-这个文件每个 epoch 只保留少量关键字段，方便直接复制文本做外部分析。
+这个文件现在整理成一个更适合直接贴出来分析的 JSON 对象，包含：
+
+- `latest`
+- `best_by_loss`
+- `best_by_metric`
+- `recent_epochs`
+
+通常把这几段贴出来就够了，不需要再手动整理整条训练曲线。
 
 transition 训练完成后，也会额外写：
 
@@ -152,19 +160,64 @@ transition valid 现在还会额外记录三类 answer 指标：
 
 以及对应的 `*_answer_stop_rate`，用来衡量 rollout 时模型有没有真的切换到 `answer`。
 
+当前主看的是：
+
+- `teacher_forced_answer_acc`
+- `rollout_direct_answer_acc`
+- `rollout_direct_answer_stop_rate`
+
+`reencode` 相关指标保留在详细输出里，主要用于辅助排查，不作为当前接口判断的主指标。
+
 transition 也会保存紧凑版 valid 摘要：
 
 ```bash
 outputs/<experiment_name>/transition_valid_compact.json
 ```
 
-这个文件同样只保留关键指标，适合直接复制给 Codex 或其他模型分析。
+这个文件也使用同样的概览结构：
+
+- `latest`
+- `best_by_loss`
+- `best_by_metric`
+- `recent_epochs`
+
+这样 transition 的 loss、type acc、decode acc、rollout answer acc 等关键结果可以直接复制给 Codex 或其他模型分析。
 
 transition 训练的初始化口径现在是固定的：
 
 - frozen codec 总是从 `transition.codec_checkpoint` 加载
 - transition backbone 总是从 `model.model_name_or_path` 加载预训练 GPT-2
 - `transition.init_checkpoint` 只用于恢复一个已经训练中的 transition checkpoint
+
+transition 训练现在还支持一个可选的 latent 辅助损失：
+
+- `transition.latent_loss_weight`
+- `transition.latent_loss_type`
+- `transition.latent_huber_weight`
+- `transition.latent_huber_delta`
+- `transition.latent_infonce_temperature`
+
+当它大于 `0` 时，会对 step 位置额外施加：
+
+- `q_n -> z_1`
+- `z_1 -> z_2`
+- `z_2 -> z_3`
+- ...
+
+的 latent 对齐监督。当前支持四种形式：
+
+- `cosine`
+- `cosine_huber`
+- `infonce`
+- `infonce_huber`
+
+同时会在 valid 中额外记录：
+
+- `latent_loss`
+- `infonce_loss`
+- `latent_huber_loss`
+- `pred_vs_target_latent_cosine`
+- `pred_vs_target_latent_mse`
 
 另外还补了三种 SFT baseline，用来判断任务本身对当前 GPT-2 是否已经过难：
 

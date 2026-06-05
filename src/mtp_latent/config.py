@@ -64,9 +64,15 @@ class TransitionConfig:
     dropout: float = 0.1
     init_source: str = "random"
     codec_checkpoint: str | None = None
+    encoder_init_checkpoint: str | None = None
     init_checkpoint: str | None = None
     type_loss_weight: float = 1.0
     decode_loss_weight: float = 1.0
+    latent_loss_weight: float = 0.0
+    latent_loss_type: str = "cosine"
+    latent_huber_weight: float = 1.0
+    latent_huber_delta: float = 1.0
+    latent_infonce_temperature: float = 0.1
 
 
 @dataclass
@@ -81,6 +87,7 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
+    grad_accum_steps: int = 1
     seed: int = 42
     device: str = "auto"
     precision: str = "bf16"
@@ -125,6 +132,16 @@ class ExperimentConfig:
     def validate(self) -> None:
         if len(self.codec_objective.horizon_weights) == 0:
             raise ValueError("codec_objective.horizon_weights must not be empty.")
+        if self.train.grad_accum_steps < 1:
+            raise ValueError("train.grad_accum_steps must be >= 1.")
+        if self.transition.latent_loss_type not in {"cosine", "cosine_huber", "infonce", "infonce_huber"}:
+            raise ValueError("transition.latent_loss_type must be one of: cosine, cosine_huber, infonce, infonce_huber.")
+        if self.transition.latent_huber_weight < 0:
+            raise ValueError("transition.latent_huber_weight must be >= 0.")
+        if self.transition.latent_huber_delta <= 0:
+            raise ValueError("transition.latent_huber_delta must be > 0.")
+        if self.transition.latent_infonce_temperature <= 0:
+            raise ValueError("transition.latent_infonce_temperature must be > 0.")
 
         if self.codec_objective.name == "decoder_token_mtp":
             horizons = self.codec_objective.token_prediction_horizons
