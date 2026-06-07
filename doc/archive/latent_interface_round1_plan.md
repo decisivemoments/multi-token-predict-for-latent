@@ -1,4 +1,6 @@
-# Latent 接口第一轮计划
+# Latent 接口第一轮计划（历史记录）
+
+> 归档说明：这份文档记录的是 transition 接口第一轮工程调整。当前研究主线不再默认 transition 是下一步，而是先验证 codec latent 的判别性、verifier 能力和轨迹几何。当前状态请看 `doc/mtp_latent_reasoning_experiment_design.md`。
 
 ## 背景
 
