@@ -1,6 +1,6 @@
 # Transition 实验阶段性状态（历史记录）
 
-> 归档说明：这份文档记录的是 2026-06-05 前后的 transition-first 思路。当前主线已经调整为先做 representation usefulness map，再决定是否继续强化 transition。当前状态请看 `doc/mtp_latent_reasoning_experiment_design.md` 和 `doc/transition_representation_analysis_plan.md`。
+> 归档说明：这份文档记录的是 2026-06-05 前后的 transition-first 思路。当前主线已经调整为先做 representation usefulness map，再决定是否继续强化 transition。当前状态请看 `doc/mtp_latent_reasoning_experiment_design.md` 和 `doc/representation_usefulness_analysis_plan.md`。
 
 ## 1. 当前现象
 

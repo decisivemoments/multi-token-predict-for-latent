@@ -32,7 +32,7 @@ Decoder(z) -> current step / answer
 
 ```text
 doc/mtp_latent_reasoning_experiment_design.md
-doc/transition_representation_analysis_plan.md
+doc/representation_usefulness_analysis_plan.md
 ```
 
 ## 数据格式
@@ -93,13 +93,16 @@ bash scripts/train_exp2a_gsm_ntp_init.sh
 bash scripts/train_exp2a_gsm_mtp_init.sh
 ```
 
-### Transition diagnostics
-
-Transition 代码存在，但当前应作为诊断对象，而不是默认主线。
+### Candidate ranking analysis
 
 ```bash
-bash scripts/train_exp3_transition_exp1_gsm_ntp.sh
-bash scripts/analyze_transition_exp1_gsm_ntp_repr.sh
+bash scripts/analyze_ranking_gsm_all.sh
+```
+
+### Latent verifier analysis
+
+```bash
+bash scripts/analyze_verifier_gsm_all.sh
 ```
 
 ### SFT sanity baselines
@@ -156,9 +159,9 @@ pred_vs_target_latent_mse
 ```text
 1. next-step candidate ranking
 2. latent-as-verifier
-3. gold latent geometry
-4. decoder sensitivity
-5. transition error decomposition
+3. hard negative ranking
+4. candidate embedding alignment
+5. transition diagnostics
 ```
 
 这一步的目标是回答：

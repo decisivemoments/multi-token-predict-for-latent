@@ -1,0 +1,12 @@
+experiment_name: verifier_exp1_gsm_ntp
+experiment_config_path: configs/exp1_gsm_ntp_init.yaml
+codec_checkpoint: outputs/exp1_gsm_ntp_init/codec_best.pt
+split: valid
+output_dir: outputs/analysis/latent_verifier/gsm
+seed: 42
+max_samples: 256
+random_negatives: 2
+same_question_negatives: 2
+hard_negatives: 4
+include_answer_targets: true
+max_examples: 32

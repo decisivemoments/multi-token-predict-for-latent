@@ -13,7 +13,8 @@ train-sft
 evaluate
 inspect-data
 show-history
-analyze-transition-repr
+analyze-candidate-ranking
+analyze-latent-verifier
 ```
 
 当前主要可运行实验：
@@ -326,7 +327,142 @@ step_acc
 answer_acc
 ```
 
-## 11. 常用命令
+## 11. Candidate ranking analysis
+
+`analyze-candidate-ranking` 当前只包含 6.1 的 next-step candidate ranking。
+
+配置字段：
+
+```yaml
+experiment_name: ranking_exp1_gsm_ntp
+experiment_config_path: configs/exp1_gsm_ntp_init.yaml
+codec_checkpoint: outputs/exp1_gsm_ntp_init/codec_best.pt
+split: valid
+output_dir: outputs/analysis/candidate_ranking/gsm
+seed: 42
+max_samples: 256
+random_negatives: 8
+same_question_negatives: 2
+include_answer_targets: true
+max_examples: 24
+```
+
+当前实现口径：
+
+```text
+prefix_i = question + previous_steps
+z_i = Encoder(prefix_i)
+candidates = gold_i + same-question negatives + cross-question negatives
+score(z_i, candidate) = - mean teacher-forced token NLL under Decoder(z_i)
+```
+
+具体步骤：
+
+```text
+1. 对 prefix_i 编码得到 z_i。
+2. 对每个 candidate 文本构造 target tokens，并手工追加 EOS。
+3. 用 Decoder(z_i) teacher-forcing 计算 candidate 的 token-level CE。
+4. 对非 padding token 求 mean NLL。
+5. 取 -mean NLL 作为 score，score 越高越好。
+6. 按 score 排候选，计算 gold rank。
+```
+
+当前 negative 类型：
+
+```text
+same_question:
+    同一道题里非当前 target 的其他 step / answer。
+
+cross_question:
+    其他题里的 step / answer。
+```
+
+输出字段：
+
+```text
+top1_accuracy
+mrr
+gold_score
+max_negative_score
+gold_minus_max_negative_margin
+negative_type_summary
+examples
+implementation_contract
+```
+
+解释：
+
+```text
+top1_accuracy 高：gold 通常被排第一。
+MRR 高：gold 即使没排第一，也通常靠前。
+margin 大：gold 比最强负例有稳定分离。
+same_question margin 大：更支持 reasoning-discriminative signal。
+cross_question margin 大但 same_question margin 小：可能主要是题目或表面格式匹配。
+```
+
+这个分析不训练额外参数，不测 transition，也不测 candidate embedding alignment。
+
+## 12. Latent verifier analysis
+
+`analyze-latent-verifier` 当前实现 6.2 的 latent-as-verifier。
+
+配置字段：
+
+```yaml
+experiment_name: verifier_exp1_gsm_ntp
+experiment_config_path: configs/exp1_gsm_ntp_init.yaml
+codec_checkpoint: outputs/exp1_gsm_ntp_init/codec_best.pt
+split: valid
+output_dir: outputs/analysis/latent_verifier/gsm
+seed: 42
+max_samples: 256
+random_negatives: 2
+same_question_negatives: 2
+hard_negatives: 4
+include_answer_targets: true
+max_examples: 32
+```
+
+当前实现口径：
+
+```text
+positive = (prefix_i, gold_i)
+negative = (prefix_i, hard / same-question / cross-question non-gold candidate)
+score = - mean teacher-forced token NLL under Decoder(z_i)
+valid if score >= threshold
+```
+
+当前 hard negative 由 gold target 直接扰动生成：
+
+```text
+hard_wrong_result
+hard_wrong_operator
+hard_wrong_operand
+hard_wrong_answer
+```
+
+当前 threshold 是 post-hoc best threshold，用于判断 score 是否有可分性，不作为最终泛化指标。
+
+输出字段：
+
+```text
+auc
+best_threshold
+score_summary
+confusion_by_type_at_best_threshold
+examples
+implementation_contract
+```
+
+常用命令：
+
+```bash
+bash scripts/analyze_verifier_exp1_gsm_ntp.sh
+bash scripts/analyze_verifier_exp1_gsm_mtp.sh
+bash scripts/analyze_verifier_gsm_all.sh
+```
+
+## 13. 常用命令
 
 训练 codec：
 
@@ -346,7 +482,8 @@ bash scripts/train_exp3_transition_exp1_gsm_ntp.sh
 表征分析：
 
 ```bash
-bash scripts/analyze_transition_exp1_gsm_ntp_repr.sh
+bash scripts/analyze_ranking_gsm_all.sh
+bash scripts/analyze_verifier_gsm_all.sh
 ```
 
 TensorBoard：
@@ -357,7 +494,7 @@ bash scripts/tensorboard_exp2a.sh
 bash scripts/tensorboard_exp3.sh
 ```
 
-## 12. 当前解释边界
+## 14. 当前解释边界
 
 可由当前 codec 结果支持的结论：
 

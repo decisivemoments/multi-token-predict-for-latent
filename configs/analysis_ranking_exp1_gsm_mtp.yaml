@@ -1,0 +1,11 @@
+experiment_name: ranking_exp1_gsm_mtp
+experiment_config_path: configs/exp1_gsm_mtp_init.yaml
+codec_checkpoint: outputs/exp1_gsm_mtp_init/codec_best.pt
+split: valid
+output_dir: outputs/analysis/candidate_ranking/gsm
+seed: 42
+max_samples: 256
+random_negatives: 8
+same_question_negatives: 2
+include_answer_targets: true
+max_examples: 24

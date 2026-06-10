@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from mtp_latent.analysis.candidate_ranking import run_candidate_ranking_analysis
+from mtp_latent.analysis.latent_verifier import run_latent_verifier_analysis
 from mtp_latent.config import ExperimentConfig
 from mtp_latent.data import build_dataloaders, build_sft_dataloaders, build_transition_dataloaders
 from mtp_latent.models import ReasoningCodec, ReasoningTransitionModel, SFTLanguageModel
@@ -168,6 +170,16 @@ def run_inspect_data(config_path: str) -> None:
     print(json.dumps(preview, indent=2, ensure_ascii=False))
 
 
+def run_analyze_candidate_ranking(config_path: str) -> None:
+    output_path = run_candidate_ranking_analysis(config_path)
+    print(output_path)
+
+
+def run_analyze_latent_verifier(config_path: str) -> None:
+    output_path = run_latent_verifier_analysis(config_path)
+    print(output_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="MTP latent reasoning experiment runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -191,6 +203,12 @@ def main() -> None:
     inspect_parser = subparsers.add_parser("inspect-data")
     inspect_parser.add_argument("--config", required=True)
 
+    analyze_ranking_parser = subparsers.add_parser("analyze-candidate-ranking")
+    analyze_ranking_parser.add_argument("--config", required=True)
+
+    analyze_verifier_parser = subparsers.add_parser("analyze-latent-verifier")
+    analyze_verifier_parser.add_argument("--config", required=True)
+
     args = parser.parse_args()
 
     if args.command == "train-codec":
@@ -205,6 +223,10 @@ def main() -> None:
         run_show_history(args.path)
     elif args.command == "inspect-data":
         run_inspect_data(args.config)
+    elif args.command == "analyze-candidate-ranking":
+        run_analyze_candidate_ranking(args.config)
+    elif args.command == "analyze-latent-verifier":
+        run_analyze_latent_verifier(args.config)
 
 
 if __name__ == "__main__":

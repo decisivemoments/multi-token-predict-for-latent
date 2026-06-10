@@ -7,7 +7,7 @@
 ```text
 doc/mtp_latent_reasoning_experiment_design.md
 doc/code_experiment_guide.md
-doc/transition_representation_analysis_plan.md
+doc/representation_usefulness_analysis_plan.md
 ```
 
 当前研究判断：
